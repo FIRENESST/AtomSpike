@@ -1,0 +1,45 @@
+encoder:
+  frame_size: 84
+  d_model: 128
+  stem_channels: [16, 32, 64]
+
+reasoner:
+  n_layers: 2
+  n_heads: 4
+  game_state_dim: 8
+  n_state_tokens: 4
+
+adapter:
+  enabled: true
+  hidden: 32
+
+policy:
+  kind: ann
+  n_layers: 2
+  action_decode: gru_ar
+  temperature: 1.0
+  spike_time_steps: 4
+
+action:
+  n_keys: 4
+  key_names: [W, A, S, D]
+  mouse_bins: 21
+
+dual_rate:
+  perception_hz: 5.0
+  policy_hz: 30.0
+
+train:
+  batch_size: 32
+  lr: 0.0003
+  epochs: 8
+  seed: 0
+  device: auto
+
+env:
+  kind: synthetic
+  max_steps: 128
+
+convert:
+  method: pmsm
+  time_steps: 1

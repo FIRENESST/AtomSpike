@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atomspike"
+version = "0.1.0"
+description = "AtomSpike: atomic-level game agent with CNN+Transformer perception and a spiking policy head"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "AtomSpike" }]
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+    "pillow>=10.0",
+    "h5py>=3.10",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+capture = ["mss>=9.0", "pynput>=1.7"]
+vizdoom = ["vizdoom>=1.2"]
+wandb = ["wandb>=0.16"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+atomspike = "atomspike.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["atomspike*"]
+
+[tool.setuptools.package-data]
+atomspike = ["py.typed"]

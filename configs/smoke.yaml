@@ -1,0 +1,38 @@
+encoder:
+  frame_size: 64
+  d_model: 64
+  stem_channels: [8, 16, 32]
+
+reasoner:
+  n_layers: 1
+  n_heads: 2
+  game_state_dim: 8
+  n_state_tokens: 2
+
+adapter:
+  enabled: true
+  hidden: 16
+
+policy:
+  kind: ann
+  n_layers: 1
+  action_decode: gru_ar
+  spike_time_steps: 2
+
+action:
+  mouse_bins: 11
+
+train:
+  batch_size: 16
+  lr: 0.001
+  epochs: 6
+  seed: 0
+
+env:
+  kind: synthetic
+  max_steps: 48
+  frame_size: 64
+
+convert:
+  method: pmsm
+  time_steps: 1
