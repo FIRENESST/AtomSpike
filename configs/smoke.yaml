@@ -14,13 +14,20 @@ adapter:
   hidden: 16
 
 policy:
-  kind: ann
+  kind: spike
   n_layers: 1
+  n_heads: 2
   action_decode: gru_ar
-  spike_time_steps: 2
+  spike_time_steps: 1
 
 action:
   mouse_bins: 11
+
+dual_rate:
+  perception_hz: 5.0
+  policy_hz: 30.0
+  mode: sim
+  pace: false
 
 train:
   batch_size: 16

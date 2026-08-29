@@ -52,7 +52,7 @@ class TemporalAdapterConfig:
 
 @dataclass
 class PolicyConfig:
-    kind: PolicyKind = "ann"
+    kind: PolicyKind = "spike"
     d_model: int = 128
     n_layers: int = 2
     n_heads: int = 4
@@ -74,10 +74,15 @@ class ActionConfig:
     n_slots: int = 8
 
 
+ClockMode = Literal["sim", "realtime"]
+
+
 @dataclass
 class DualRateConfig:
     perception_hz: float = 5.0
     policy_hz: float = 30.0
+    mode: ClockMode = "sim"
+    pace: bool = False
 
     @property
     def policy_period_s(self) -> float:
@@ -142,6 +147,13 @@ class AtomSpikeConfig:
         self.adapter.d_model = d
         self.policy.d_model = d
         self.env.frame_size = self.encoder.frame_size
+        if self.policy.n_heads < 1 or d % self.policy.n_heads != 0:
+            for h in (8, 4, 2, 1):
+                if d % h == 0:
+                    self.policy.n_heads = h
+                    break
+        if self.reasoner.n_heads < 1 or d % self.reasoner.n_heads != 0:
+            self.reasoner.n_heads = self.policy.n_heads
         return self
 
 

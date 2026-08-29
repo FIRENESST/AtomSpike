@@ -103,7 +103,10 @@ def cmd_eval(args) -> int:
 
 
 def cmd_play(args) -> int:
+    from atomspike.envs import make_env
     from atomspike.eval.metrics import evaluate_policy
+    from atomspike.runtime.loop import DualRateLoop
+    from atomspike.train.common import load_agent, resolve_device
 
     if args.inject:
         print(
@@ -113,8 +116,49 @@ def cmd_play(args) -> int:
         )
         return 2
     cfg = _cfg(args)
-    result = evaluate_policy(cfg, args.ckpt, episodes=args.episodes, deterministic=not args.sample)
-    print(json.dumps(result, indent=2))
+    if getattr(args, "eval_only", False):
+        result = evaluate_policy(cfg, args.ckpt, episodes=args.episodes, deterministic=not args.sample)
+        print(json.dumps(result, indent=2))
+        return 0
+    device = resolve_device(cfg.train.device)
+    agent = load_agent(args.ckpt, cfg, device)
+    agent.eval()
+    env = make_env(
+        cfg.env.kind,
+        frame_size=cfg.env.frame_size,
+        max_steps=cfg.env.max_steps,
+        seed=cfg.env.seed,
+        action_cfg=cfg.action,
+    )
+    loop = DualRateLoop(agent, cfg, device, mode="realtime", pace=not args.unpaced)
+    successes = 0
+    for ep in range(args.episodes):
+        loop.reset()
+        obs = env.reset(seed=cfg.env.seed + ep)
+        while True:
+            tokens, info = loop.tick(obs.frame, obs.game_state, deterministic=not args.sample)
+            nxt = env.step(tokens)
+            obs = nxt
+            if nxt.done:
+                successes += int(bool(nxt.info.get("success", False)))
+                break
+    env.close()
+    hz = loop.clock.scheduled_hz()
+    print(
+        json.dumps(
+            {
+                "success_rate": successes / max(1, args.episodes),
+                "clock_mode": loop.clock.mode,
+                "paced": loop.clock.pace,
+                "policy_hz": hz["policy_hz"],
+                "perception_hz": hz["perception_hz"],
+                "n_policy": loop.stats.n_policy,
+                "n_reason": loop.stats.n_reason,
+                "latency_p95_ms": loop.stats.p95_ms(),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -127,7 +171,7 @@ def cmd_pipeline(args) -> int:
         args.workdir,
         episodes=args.episodes,
         skip_rl=args.skip_rl,
-        skip_peft=not args.peft,
+        skip_peft=args.skip_peft,
         skip_convert=args.skip_convert,
     )
     print(json.dumps(result, indent=2))
@@ -136,36 +180,64 @@ def cmd_pipeline(args) -> int:
 
 def cmd_smoke(args) -> int:
     from atomspike.config import load_config
+    from atomspike.convert.pmsm import pmsm_status
     from atomspike.eval.metrics import evaluate_policy
+    from atomspike.train.common import load_agent, resolve_device
     from atomspike.train.pipeline import run_pipeline
+    from atomspike.verify import run_verify
 
     cfg_path = ROOT / "configs" / "smoke.yaml"
     cfg = load_config(cfg_path if cfg_path.exists() else None)
+    verify = run_verify(cfg_path if cfg_path.exists() else Path("configs/smoke.yaml"))
     workdir = Path(args.workdir)
     result = run_pipeline(
         cfg,
         workdir,
         episodes=args.episodes,
         skip_rl=False,
-        skip_peft=True,
+        skip_peft=False,
         skip_convert=False,
     )
-    metrics = evaluate_policy(cfg, result["bc"]["checkpoint"], episodes=8)
-    metrics_rl = None
-    if "rl" in result:
-        metrics_rl = evaluate_policy(cfg, result["rl"]["checkpoint"], episodes=8)
-    metrics_snn = None
+    metrics = evaluate_policy(cfg, result["bc"]["checkpoint"], episodes=6)
+    metrics_rl = evaluate_policy(cfg, result["rl"]["checkpoint"], episodes=6) if "rl" in result else None
+    metrics_peft = evaluate_policy(cfg, result["peft"]["checkpoint"], episodes=6) if "peft" in result else None
+    metrics_snn = evaluate_policy(cfg, result["snn"]["checkpoint"], episodes=6) if "snn" in result else None
+    snn_status = None
     if "snn" in result:
-        metrics_snn = evaluate_policy(cfg, result["snn"]["checkpoint"], episodes=8)
+        device = resolve_device(cfg.train.device)
+        snn_agent = load_agent(result["snn"]["checkpoint"], cfg, device)
+        snn_status = pmsm_status(snn_agent)
+    lora_ok = bool(result.get("peft", {}).get("lora_wrapped", 0) > 0)
+    convert_ok = bool(snn_status and snn_status.get("enabled"))
+    clock_ok = bool(metrics.get("clock_mode") == "sim" and metrics.get("scheduled_policy_hz", 0) > 0)
     report = {
+        "verify": verify,
         "pipeline": result,
         "eval_bc": metrics,
         "eval_rl": metrics_rl,
+        "eval_peft": metrics_peft,
         "eval_snn": metrics_snn,
-        "ok": metrics["latency_p95_ms"] >= 0 and result["bc"]["params"] > 0,
+        "snn_status": snn_status,
+        "lora_ok": lora_ok,
+        "convert_persisted": convert_ok,
+        "clock_ok": clock_ok,
+        "ok": bool(verify and lora_ok and convert_ok and clock_ok and result["bc"]["params"] > 0),
     }
-    print(json.dumps(report, indent=2))
+    print(json.dumps(report, indent=2, default=_json_default))
     return 0 if report["ok"] else 1
+
+
+def cmd_verify(args) -> int:
+    from atomspike.config import load_config
+    from atomspike.verify import run_verify
+
+    cfg_path = Path(args.config) if getattr(args, "config", None) else ROOT / "configs" / "smoke.yaml"
+    if not cfg_path.exists():
+        cfg_path = ROOT / "configs" / "default.yaml"
+    load_config(cfg_path)
+    report = run_verify(cfg_path)
+    print(json.dumps(report, indent=2, default=_json_default))
+    return 0
 
 
 def cmd_info(args) -> int:
@@ -180,6 +252,9 @@ def cmd_info(args) -> int:
         "action_slots": cfg.action.n_slots,
         "slot_vocabs": list(agent.spec.slot_vocabs),
         "perception_every_n": cfg.dual_rate.perception_every_n,
+        "policy_hz": cfg.dual_rate.policy_hz,
+        "perception_hz": cfg.dual_rate.perception_hz,
+        "clock_mode": cfg.dual_rate.mode,
         "policy_kind": cfg.policy.kind,
         "action_decode": cfg.policy.action_decode,
         "config": dump_config(cfg),
@@ -243,20 +318,26 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--episodes", type=int, default=12)
     s.set_defaults(func=cmd_eval)
 
-    s = sub.add_parser("play", help="closed-loop rollout in the research env")
+    s = sub.add_parser("play", help="closed-loop rollout paced at 30Hz")
     _add_config_arg(s, suppress=True)
     s.add_argument("--ckpt", required=True)
     s.add_argument("--episodes", type=int, default=4)
     s.add_argument("--sample", action="store_true")
+    s.add_argument("--unpaced", action="store_true", help="realtime clock without sleep")
+    s.add_argument("--eval-only", action="store_true", help="sim-time eval instead of paced play")
     s.add_argument("--inject", action="store_true", help="OS inject (refused)")
     s.set_defaults(func=cmd_play)
+
+    s = sub.add_parser("verify", help="regression tests: LoRA reload, PMSM persist, 30Hz clock")
+    _add_config_arg(s, suppress=True)
+    s.set_defaults(func=cmd_verify)
 
     s = sub.add_parser("pipeline", help="run T0-T6 on the synthetic env")
     _add_config_arg(s, suppress=True)
     s.add_argument("--workdir", default="runs/default")
     s.add_argument("--episodes", type=int, default=40)
     s.add_argument("--skip-rl", action="store_true")
-    s.add_argument("--peft", action="store_true")
+    s.add_argument("--skip-peft", action="store_true")
     s.add_argument("--skip-convert", action="store_true")
     s.set_defaults(func=cmd_pipeline)
 

@@ -6,6 +6,7 @@ from torch import Tensor, nn
 
 from atomspike.config import PolicyConfig
 from atomspike.models.actions import ActionSpec
+from atomspike.models.activations import Act
 from atomspike.models.decoder import ActionDecoder
 
 
@@ -15,7 +16,7 @@ class ANNPolicy(nn.Module):
         self.pre = nn.Sequential(
             nn.LayerNorm(cfg.d_model),
             nn.Linear(cfg.d_model, cfg.d_model),
-            nn.GELU(),
+            Act("gelu"),
             nn.Linear(cfg.d_model, cfg.d_model),
         )
         self.decoder = ActionDecoder(cfg.d_model, spec, mode=cfg.action_decode)

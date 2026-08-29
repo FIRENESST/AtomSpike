@@ -9,7 +9,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
-from atomspike.config import AtomSpikeConfig
+from atomspike.config import AtomSpikeConfig, dump_config
 from atomspike.models.agent import AtomSpikeAgent
 
 
@@ -62,10 +62,14 @@ def make_loader(ds: Dataset, cfg: AtomSpikeConfig, sampler=None) -> DataLoader:
 def save_checkpoint(agent: AtomSpikeAgent, path: str | Path, extra: dict | None = None) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    merged = dict(extra or {})
+    lora_meta = getattr(agent, "_lora_meta", None)
+    if lora_meta and "lora" not in merged:
+        merged["lora"] = lora_meta
     payload = {
         "model": agent.state_dict(),
-        "cfg": agent.cfg.__dict__,
-        "extra": extra or {},
+        "cfg": dump_config(agent.cfg),
+        "extra": merged,
     }
     torch.save(payload, path)
     return path
@@ -76,6 +80,13 @@ def load_agent(path: str | Path, cfg: AtomSpikeConfig, device: torch.device) -> 
         ckpt = torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(path, map_location=device)
+    extra = ckpt.get("extra") or {}
     agent = AtomSpikeAgent(cfg).to(device)
+    lora = extra.get("lora")
+    if lora:
+        from atomspike.models.lora import apply_lora
+
+        apply_lora(agent, int(lora["r"]), int(lora["alpha"]))
     agent.load_state_dict(ckpt["model"], strict=False)
+    agent.to(device)
     return agent

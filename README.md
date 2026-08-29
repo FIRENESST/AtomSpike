@@ -10,20 +10,21 @@
 |---|---|---|
 | 感知 5Hz / 策略 30Hz，策略只吃缓存特征 | 5Hz 推理 + **30Hz 时序残差适配器**（当前帧与帧差） | 200ms 视觉冻结对瞄准/走位过钝，残差只增加极少算力 |
 | 8-token 用完整 Transformer 解码器 | 默认 **GRU 自回归**（可选 parallel / transformer_ar） | 8 步依赖够用 GRU，30Hz 延迟更稳 |
-| 从零训 SNN 或全程代理梯度 | 主线 **ANN 训练 → PMSM T=1 免训练转换**；脉冲头仅作对照 | 与更新的 README 一致，避开代理梯度不稳 |
+| 从零训 SNN 或全程代理梯度 | 感知用可切换的 `Act`；默认 **脉冲策略头**；T6 把 `Act` 的 spike 开关写入 buffer，**存盘后再加载仍是 SNN** | 以前替换 nn.ReLU 后 load 回 ANN，转换结果会蒸发 |
 | 在线 RL 占卡采样 | **优势加权 BC + KL 锚定教师**（AW-BC / SPAG 离线精神） | 单机双卡也不该让采样绑死训练卡 |
-| 逐游戏全参微调 | 骨干冻结 + **内置 LoRA**（不强制 HuggingFace PEFT） | 小模型也能做 T4，少一个重依赖 |
+| 逐游戏全参微调 | 冻 CNN 骨干 + 推理层 **显式 Q/K/V Linear 上的 LoRA**（存盘可还原） | 以前匹配 `in_proj` 名字，对融合 MHA 包装数为 0 |
 | 必须装 ViZDoom 才能开发 | **SyntheticAimEnv** 闭环（走位 + 瞄准 + 点击） | 笔记本 CPU 即可验证数据/训练/转换/评测 |
 | 单 one-hot 组合动作 | 8 slot：4 键状态机 + 量化鼠标 + 2 鼠标键，**非法转移 mask** | 并发按键不爆炸词表，press/hold/release 合法 |
+| 「每 6 次 forward 更新上下文」 | **DualRateClock**：仿真时钟按 1/30s 推进；`play` 按墙钟 sleep 到 30Hz | 紧循环 eval 不是 30Hz；调度必须基于时间 |
 
 LIF 膜电位跨 30Hz tick 保持，与「按下 / 持续 / 释放」同构；转换后的稀疏度作为能耗代理，而不是假设普通 GPU 上 SNN 一定更快。
 
 ## 架构
 
 ```
-帧 30–60fps ──► CNN Encoder ──► Transformer Reasoner (5Hz)
+帧 30–60fps ──► CNN Encoder ──► Transformer Reasoner (5Hz, DualRateClock)
                       │                    │
-                      └── 帧差残差(30Hz) ──┴──► Policy (ANN 或 Spike) ──► 8-token
+                      └── 帧差残差(30Hz) ──┴──► Spike Policy (默认) / ANN ──► 8-token
                                                                     │
                                                               温度采样 / argmax
                                                                     │
@@ -67,9 +68,12 @@ src/
 
 ```bash
 pip install -e .
+python -m atomspike verify --config configs/smoke.yaml
 python -m atomspike info --config configs/smoke.yaml
 python -m atomspike smoke --workdir runs/smoke
 ```
+
+`verify` 会断言三件事：T4 LoRA 包装数 > 0 且 save/load 后输出不变；T6 PMSM 改变输出且加载后仍是 spike 模式；仿真时钟 30 次策略 tick 对应 5 次感知，墙钟 pace 接近 30Hz / 5Hz。
 
 分步：
 
@@ -77,8 +81,10 @@ python -m atomspike smoke --workdir runs/smoke
 python -m atomspike collect --out runs/demos.h5 --episodes 40
 python -m atomspike train-bc --data runs/demos.h5 --out runs/bc.pt --rabc
 python -m atomspike train-rl --data runs/demos.h5 --teacher runs/bc.pt --out runs/rl.pt
-python -m atomspike convert --ckpt runs/rl.pt --out runs/snn.pt --method pmsm
-python -m atomspike eval --ckpt runs/bc.pt --episodes 12
+python -m atomspike train-peft --data runs/demos.h5 --backbone runs/rl.pt --out runs/peft.pt
+python -m atomspike convert --ckpt runs/peft.pt --out runs/snn.pt --method pmsm
+python -m atomspike eval --ckpt runs/snn.pt --episodes 12
+python -m atomspike play --ckpt runs/snn.pt --episodes 2
 ```
 
 合规：只在合成环境、ViZDoom / MineRL 一类研究环境里跑。`play --inject` 会被拒绝——不要接到线上对战。
@@ -95,5 +101,5 @@ python -m atomspike eval --ckpt runs/bc.pt --episodes 12
 |---|---|---|
 | 控制 | `eval` success_rate | 对标专家 / 公开基线 |
 | 时序 | expert_token_acc | 与 ANN 差距 ≤ 5% |
-| 实时 | latency_p95_ms | ≤ 33ms @ 30Hz |
+| 实时 | `eval` scheduled_*_hz / `play` policy_hz | 仿真 30/5Hz；play 墙钟 ≈30Hz |
 | 效率 | convert 的 sparsity | 低于 dense ANN 的代理能耗 |

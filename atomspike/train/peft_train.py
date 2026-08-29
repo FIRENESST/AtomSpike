@@ -11,7 +11,7 @@ from tqdm import tqdm
 from atomspike.config import AtomSpikeConfig
 from atomspike.data.io import H5DemoDataset
 from atomspike.models.agent import AtomSpikeAgent, action_ce_loss
-from atomspike.models.lora import freeze_module, inject_lora, trainable_parameter_count
+from atomspike.models.lora import apply_lora, trainable_parameter_count
 from atomspike.train.common import load_agent, make_loader, resolve_device, save_checkpoint, set_seed
 
 
@@ -25,15 +25,13 @@ def train_peft(
     set_seed(cfg.train.seed)
     device = resolve_device(cfg.train.device)
     agent = load_agent(backbone_ckpt, cfg, device)
-    freeze_module(agent.encoder)
-    freeze_module(agent.reasoner)
-    n_wrap = inject_lora(agent.reasoner, cfg.train.lora_r, cfg.train.lora_alpha, ("linear", "in_proj", "out"))
-    n_wrap += inject_lora(agent.policy, cfg.train.lora_r, cfg.train.lora_alpha, ("qkv", "out", "pre", "heads"))
-    # unfreeze action heads always
-    for p in agent.policy.parameters():
-        if p.ndim == 2 and p.requires_grad is False and p.shape[-1] <= 64:
-            p.requires_grad = True
+    if getattr(agent, "_lora_meta", None) is None:
+        meta = apply_lora(agent, cfg.train.lora_r, cfg.train.lora_alpha)
+    else:
+        meta = agent._lora_meta
     train_n, total_n = trainable_parameter_count(agent)
+    if train_n <= 0:
+        raise RuntimeError("T4 LoRA left 0 trainable parameters")
     ds = H5DemoDataset(data_path)
     loader = make_loader(ds, cfg)
     opt = torch.optim.AdamW((p for p in agent.parameters() if p.requires_grad), lr=cfg.train.lr)
@@ -56,12 +54,17 @@ def train_peft(
             running += float(loss.item()) * frames.size(0)
             n += frames.size(0)
         history.append(running / max(1, n))
-    ckpt = save_checkpoint(
-        agent,
-        out_path,
-        extra={"peft_loss": history, "lora_wrapped": n_wrap, "trainable": train_n, "total": total_n},
-    )
-    return {"checkpoint": str(ckpt), "loss": history, "trainable": train_n, "total": total_n, "lora_wrapped": n_wrap}
+    meta = {**meta, "trainable": train_n, "total": total_n}
+    agent._lora_meta = meta
+    ckpt = save_checkpoint(agent, out_path, extra={"peft_loss": history, "lora": meta})
+    return {
+        "checkpoint": str(ckpt),
+        "loss": history,
+        "trainable": train_n,
+        "total": total_n,
+        "lora_wrapped": meta["wrapped"],
+        "lora_params": meta["lora_params"],
+    }
 
 
 def distill_ann_to_small(

@@ -6,6 +6,26 @@ import torch
 from torch import Tensor, nn
 
 from atomspike.config import ReasonerConfig
+from atomspike.models.activations import Act
+from atomspike.models.attention import MultiHeadSelfAttention
+
+
+class ReasonerBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, mlp_ratio: float, dropout: float):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = MultiHeadSelfAttention(d_model, n_heads, dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+        hidden = int(d_model * mlp_ratio)
+        self.fc1 = nn.Linear(d_model, hidden)
+        self.act = Act("gelu")
+        self.fc2 = nn.Linear(hidden, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.drop(self.attn(self.norm1(x)))
+        x = x + self.drop(self.fc2(self.act(self.fc1(self.norm2(x)))))
+        return x
 
 
 class SemanticReasoner(nn.Module):
@@ -13,24 +33,13 @@ class SemanticReasoner(nn.Module):
         super().__init__()
         self.d_model = cfg.d_model
         self.n_state_tokens = cfg.n_state_tokens
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_model,
-            nhead=cfg.n_heads,
-            dim_feedforward=int(cfg.d_model * cfg.mlp_ratio),
-            dropout=cfg.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.blocks = nn.ModuleList(
+            ReasonerBlock(cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
+            for _ in range(cfg.n_layers)
         )
-        try:
-            self.blocks = nn.TransformerEncoder(
-                encoder_layer, num_layers=cfg.n_layers, enable_nested_tensor=False
-            )
-        except TypeError:
-            self.blocks = nn.TransformerEncoder(encoder_layer, num_layers=cfg.n_layers)
         self.state_proj = nn.Sequential(
             nn.Linear(cfg.game_state_dim, cfg.d_model),
-            nn.GELU(),
+            Act("gelu"),
             nn.Linear(cfg.d_model, cfg.d_model * cfg.n_state_tokens),
         )
         self.cls = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
@@ -47,5 +56,6 @@ class SemanticReasoner(nn.Module):
         state_tokens = self.state_proj(game_state).view(b, self.n_state_tokens, self.d_model)
         cls = self.cls.expand(b, -1, -1)
         seq = torch.cat([cls, visual_tokens, state_tokens], dim=1)
-        seq = self.blocks(seq)
+        for block in self.blocks:
+            seq = block(seq)
         return self.norm(seq[:, 0])

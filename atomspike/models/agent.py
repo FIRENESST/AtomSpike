@@ -31,11 +31,9 @@ class AtomSpikeAgent(nn.Module):
         else:
             raise ValueError(f"unknown policy kind: {cfg.policy.kind}")
         self._context: Tensor | None = None
-        self._tick = 0
 
     def reset_runtime(self) -> None:
         self._context = None
-        self._tick = 0
         reset = getattr(self.policy, "reset_state", None)
         if callable(reset):
             reset()
@@ -85,12 +83,9 @@ class AtomSpikeAgent(nn.Module):
         prev_frames: Tensor | None = None,
         temperature: float | None = None,
         deterministic: bool = False,
-        dual_rate: bool = True,
+        reason_tick: bool = True,
     ) -> Tensor:
-        """Return [B, 8] action tokens. Runtime uses dual-rate by default."""
-        every = self.cfg.dual_rate.perception_every_n if dual_rate else 1
-        reason_tick = (self._tick % every) == 0
-        self._tick += 1
+        """Return [B, 8] action tokens. Dual-rate is owned by DualRateClock."""
         out = self.forward(
             frames,
             game_state,

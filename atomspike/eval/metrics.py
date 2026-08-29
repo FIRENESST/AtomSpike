@@ -10,6 +10,7 @@ import torch
 from numpy.typing import NDArray
 
 from atomspike.config import AtomSpikeConfig
+from atomspike.convert.pmsm import pmsm_status
 from atomspike.envs import make_env
 from atomspike.models.agent import AtomSpikeAgent
 from atomspike.runtime.loop import DualRateLoop
@@ -51,7 +52,7 @@ def evaluate_policy(
         seed=cfg.env.seed + 1000,
         action_cfg=cfg.action,
     )
-    loop = DualRateLoop(agent, cfg, device)
+    loop = DualRateLoop(agent, cfg, device, mode="sim", pace=False)
     successes = 0
     returns = []
     expert_match = []
@@ -72,12 +73,19 @@ def evaluate_policy(
                 returns.append(ep_ret)
                 break
     env.close()
+    hz = loop.clock.scheduled_hz()
+    status = pmsm_status(agent)
     return {
         "success_rate": successes / max(1, episodes),
         "return_mean": float(np.mean(returns) if returns else 0.0),
         "latency_p95_ms": loop.stats.p95_ms(),
         "n_policy_ticks": loop.stats.n_policy,
         "n_reason_ticks": loop.stats.n_reason,
+        "scheduled_policy_hz": hz["policy_hz"],
+        "scheduled_perception_hz": hz["perception_hz"],
+        "clock_mode": loop.clock.mode,
+        "pmsm_enabled": status["enabled"],
+        "pmsm_n_acts": status.get("n_acts", 0),
         "expert_token_acc": float(np.mean(expert_match) if expert_match else 0.0),
         "episodes": episodes,
         "params": agent.parameter_count(),

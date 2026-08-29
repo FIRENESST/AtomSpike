@@ -1,8 +1,9 @@
-"""Minimal LoRA wrappers so per-game PEFT does not need HuggingFace PEFT."""
+"""LoRA on real Linear layers. Reconstruct wrappers before load_state_dict."""
 
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 from torch import Tensor, nn
@@ -33,16 +34,54 @@ def freeze_module(module: nn.Module) -> None:
         p.requires_grad = False
 
 
-def inject_lora(module: nn.Module, r: int, alpha: int, name_substr: tuple[str, ...] = ("qkv", "out", "pre")) -> int:
-    """Replace matching Linear children with LoRALinear. Returns wrap count."""
+def wrap_linears(module: nn.Module, r: int, alpha: int) -> int:
+    """Replace every nn.Linear descendant with LoRALinear. Returns wrap count."""
     count = 0
     for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear) and any(s in name.lower() for s in name_substr):
+        if isinstance(child, LoRALinear):
+            continue
+        if isinstance(child, nn.Linear):
             setattr(module, name, LoRALinear(child, r=r, alpha=alpha))
             count += 1
         else:
-            count += inject_lora(child, r, alpha, name_substr)
+            count += wrap_linears(child, r, alpha)
     return count
+
+
+def lora_param_count(module: nn.Module) -> int:
+    n = 0
+    for m in module.modules():
+        if isinstance(m, LoRALinear):
+            n += m.lora_a.numel() + m.lora_b.numel()
+    return n
+
+
+def apply_lora(agent: nn.Module, r: int, alpha: int) -> dict[str, Any]:
+    """Freeze perception backbone, inject LoRA into the reasoner.
+
+    Policy head stays fully trainable (small). Raises if nothing was wrapped.
+    """
+    encoder = getattr(agent, "encoder", None)
+    reasoner = getattr(agent, "reasoner", None)
+    if encoder is None or reasoner is None:
+        raise RuntimeError("apply_lora expects an agent with encoder and reasoner")
+    freeze_module(encoder)
+    freeze_module(reasoner)
+    n = wrap_linears(reasoner, r, alpha)
+    if n <= 0:
+        raise RuntimeError(
+            "T4 LoRA wrapped 0 Linear layers. Reasoner must expose nn.Linear "
+            "(q/k/v/out/fc), not fused MultiheadAttention.in_proj_weight."
+        )
+    meta = {
+        "r": int(r),
+        "alpha": int(alpha),
+        "wrapped": int(n),
+        "targets": ["reasoner"],
+        "lora_params": lora_param_count(agent),
+    }
+    agent._lora_meta = meta  # type: ignore[attr-defined]
+    return meta
 
 
 def trainable_parameter_count(module: nn.Module) -> tuple[int, int]:

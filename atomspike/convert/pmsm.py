@@ -1,8 +1,7 @@
-"""T6 training-free ANN → SNN conversion (PMSM-style T=1).
+"""T6 training-free ANN → SNN conversion that survives checkpoint load.
 
-PMSM maps dense activations to polarity-aware spikes at a single time-step.
-We calibrate thresholds on a demo batch, replace ReLU/GELU with a hard spike,
-and keep Linear/Conv weights unchanged. No backprop.
+Activations are `Act` modules with spike_mode/threshold buffers. Conversion
+flips those buffers; load_state_dict restores them. No module-class swap.
 """
 
 from __future__ import annotations
@@ -14,57 +13,83 @@ from torch import Tensor, nn
 
 from atomspike.config import AtomSpikeConfig
 from atomspike.data.io import H5DemoDataset
+from atomspike.models.activations import Act, iter_acts
 from atomspike.models.agent import AtomSpikeAgent
 from atomspike.train.common import load_agent, resolve_device, save_checkpoint
 
 
-class SpikeReLU(nn.Module):
-    def __init__(self, threshold: float = 0.0, scale: float = 1.0):
-        super().__init__()
-        self.threshold = float(threshold)
-        self.scale = float(scale)
-
-    def forward(self, x: Tensor) -> Tensor:
-        spike = (x > self.threshold).to(x.dtype)
-        return spike * self.scale
-
-
-def _replace_activations(module: nn.Module, threshold: float) -> int:
+def enable_pmsm(agent: nn.Module, threshold: float, scale: float = 1.0) -> int:
     n = 0
-    for m in list(module.modules()):
-        if isinstance(m, (nn.TransformerEncoderLayer, nn.TransformerDecoderLayer)):
-            if not isinstance(getattr(m, "activation", None), SpikeReLU):
-                m.activation = SpikeReLU(threshold=threshold, scale=1.0)
-                n += 1
-    for parent in list(module.modules()):
-        for name, child in list(parent.named_children()):
-            if isinstance(child, (nn.ReLU, nn.GELU, nn.SiLU)):
-                setattr(parent, name, SpikeReLU(threshold=threshold, scale=1.0))
-                n += 1
+    for act in iter_acts(agent):
+        act.set_spike(True, threshold=threshold, scale=scale)
+        n += 1
+    if n <= 0:
+        raise RuntimeError("PMSM found 0 Act modules; encoder/reasoner must use Act")
     return n
+
+
+def disable_pmsm(agent: nn.Module) -> int:
+    n = 0
+    for act in iter_acts(agent):
+        act.set_spike(False)
+        n += 1
+    return n
+
+
+def pmsm_status(agent: nn.Module) -> dict:
+    acts = list(iter_acts(agent))
+    if not acts:
+        return {"enabled": False, "n_acts": 0, "threshold": 0.0}
+    enabled = all(a.is_spike for a in acts)
+    return {
+        "enabled": enabled,
+        "n_acts": len(acts),
+        "n_spike": sum(1 for a in acts if a.is_spike),
+        "threshold": float(acts[0].threshold.item()),
+    }
 
 
 @torch.no_grad()
 def _calibrate_threshold(agent: AtomSpikeAgent, frames: Tensor, state: Tensor, percentile: float) -> float:
-    acts: list[Tensor] = []
+    collected: list[Tensor] = []
 
     def hook(_m, _inp, out):
         if isinstance(out, Tensor):
-            acts.append(out.detach().float().abs().flatten())
+            collected.append(out.detach().float().abs().flatten())
 
-    handles = []
-    for m in agent.modules():
-        if isinstance(m, (nn.ReLU, nn.GELU)):
-            handles.append(m.register_forward_hook(hook))
+    disable_pmsm(agent)
+    handles = [m.register_forward_hook(hook) for m in iter_acts(agent)]
     agent.eval()
+    agent.reset_runtime()
     agent(frames, state, reason_tick=True)
     for h in handles:
         h.remove()
-    if not acts:
+    if not collected:
         return 0.0
-    cat = torch.cat(acts)
+    cat = torch.cat(collected)
     k = max(0, min(cat.numel() - 1, int(cat.numel() * percentile / 100.0)))
     return float(torch.kthvalue(cat, k + 1).values)
+
+
+@torch.no_grad()
+def measure_firing_rate(agent: AtomSpikeAgent, device: torch.device) -> float:
+    rates: list[float] = []
+
+    def hook(_m, _i, out):
+        if isinstance(out, Tensor):
+            rates.append(float((out > 0).float().mean().item()))
+
+    handles = [m.register_forward_hook(hook) for m in iter_acts(agent) if m.is_spike]
+    dummy_f = torch.rand(2, 3, agent.cfg.encoder.frame_size, agent.cfg.encoder.frame_size, device=device)
+    dummy_s = torch.zeros(2, agent.cfg.reasoner.game_state_dim, device=device)
+    agent.eval()
+    agent.reset_runtime()
+    agent(dummy_f, dummy_s, reason_tick=True)
+    for h in handles:
+        h.remove()
+    if not rates:
+        return 0.0
+    return float(sum(rates) / len(rates))
 
 
 def convert_checkpoint(
@@ -83,9 +108,15 @@ def convert_checkpoint(
         thr = _calibrate_threshold(agent, frames, state, cfg.convert.threshold_percentile)
     else:
         thr = 0.0
-    n_replaced = _replace_activations(agent, threshold=thr)
-    sparsity = _measure_sparsity(agent, device)
-    path = save_checkpoint(agent, out_path, extra={"pmsm_threshold": thr, "replaced": n_replaced, "sparsity": sparsity})
+    n_replaced = enable_pmsm(agent, threshold=thr)
+    sparsity = measure_firing_rate(agent, device)
+    extra = {
+        "pmsm": {"enabled": True, "threshold": thr, "n_acts": n_replaced, "method": "pmsm"},
+        "sparsity": sparsity,
+        "method": "pmsm",
+        "time_steps": cfg.convert.time_steps,
+    }
+    path = save_checkpoint(agent, out_path, extra=extra)
     return {
         "checkpoint": str(path),
         "threshold": thr,
@@ -93,24 +124,5 @@ def convert_checkpoint(
         "sparsity": sparsity,
         "method": "pmsm",
         "time_steps": cfg.convert.time_steps,
+        "status": pmsm_status(agent),
     }
-
-
-@torch.no_grad()
-def _measure_sparsity(agent: AtomSpikeAgent, device: torch.device) -> float:
-    spikes = []
-
-    def hook(m, _i, out):
-        if isinstance(out, Tensor):
-            spikes.append(float((out > 0).float().mean().item()))
-
-    handles = [m.register_forward_hook(hook) for m in agent.modules() if isinstance(m, SpikeReLU)]
-    dummy_f = torch.rand(2, 3, agent.cfg.encoder.frame_size, agent.cfg.encoder.frame_size, device=device)
-    dummy_s = torch.zeros(2, agent.cfg.reasoner.game_state_dim, device=device)
-    agent.eval()
-    agent(dummy_f, dummy_s, reason_tick=True)
-    for h in handles:
-        h.remove()
-    if not spikes:
-        return 0.0
-    return float(sum(spikes) / len(spikes))

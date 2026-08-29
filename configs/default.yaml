@@ -14,11 +14,12 @@ adapter:
   hidden: 32
 
 policy:
-  kind: ann
+  kind: spike
   n_layers: 2
+  n_heads: 4
   action_decode: gru_ar
   temperature: 1.0
-  spike_time_steps: 4
+  spike_time_steps: 2
 
 action:
   n_keys: 4
@@ -28,6 +29,8 @@ action:
 dual_rate:
   perception_hz: 5.0
   policy_hz: 30.0
+  mode: sim
+  pace: false
 
 train:
   batch_size: 32

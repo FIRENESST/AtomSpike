@@ -20,7 +20,7 @@ def run_pipeline(
     workdir: str | Path,
     episodes: int = 40,
     skip_rl: bool = False,
-    skip_peft: bool = True,
+    skip_peft: bool = False,
     skip_convert: bool = False,
 ) -> dict:
     workdir = Path(workdir)

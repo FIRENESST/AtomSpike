@@ -12,6 +12,7 @@ from torch import Tensor, nn
 
 from atomspike.config import PolicyConfig
 from atomspike.models.actions import ActionSpec
+from atomspike.models.activations import Act
 from atomspike.models.decoder import ActionDecoder
 from atomspike.models.lif import LIFCell
 
@@ -52,7 +53,7 @@ class SpikeBlock(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
+            Act("gelu"),
             nn.Linear(d_model * 2, d_model),
         )
         self.lif = LIFCell(tau=tau, v_th=v_th)
@@ -87,28 +88,35 @@ class SpikePolicy(nn.Module):
 
     def forward(self, context: Tensor, tokens: Tensor | None = None) -> dict[str, object]:
         x = context.unsqueeze(1)  # [B, 1, D]
-        spike_count = 0.0
-        elems = 0.0
-        state = self._state
-        in_mem = self._in_mem
-        for _ in range(max(1, self.time_steps)):
+        if self.training:
+            state, in_mem = None, None
+            steps = max(1, self.time_steps)
+        else:
+            state, in_mem = self._state, self._in_mem
+            if in_mem is not None and in_mem.size(0) != x.size(0):
+                state, in_mem = None, None
+            steps = 1
+        spike_rates: list[Tensor] = []
+        for _ in range(steps):
             spiked, in_mem = self.in_lif(x, in_mem)
+            spike_rates.append(spiked.detach().float().mean())
             h = spiked
             new_state: list[dict[str, Tensor]] = []
             for i, block in enumerate(self.blocks):
                 st = None if state is None else state[i]
                 h, st_out = block(h, st)
                 new_state.append(st_out)
-                spike_count += float(st_out["mem"].new_tensor(0.0))  # placeholder
-                elems += h.numel()
+                if st_out.get("mq") is not None:
+                    spike_rates.append(st_out["mq"].detach().float().mean())
             x = h
             state = new_state
-        self._state = _detach_state(state) if not self.training else state
-        self._in_mem = in_mem.detach() if (in_mem is not None and not self.training) else in_mem
+        if not self.training:
+            self._state = _detach_state(state)
+            self._in_mem = in_mem.detach() if in_mem is not None else None
         pooled = x.mean(dim=1)
         logits = self.decoder(pooled, tokens)
         value = self.value_head(pooled).squeeze(-1)
-        sparsity = _mean_sparsity(state)
+        sparsity = torch.stack(spike_rates).mean() if spike_rates else pooled.new_zeros(())
         return {"logits": logits, "value": value, "spikes": sparsity}
 
 
@@ -116,19 +124,3 @@ def _detach_state(state: list[dict[str, Tensor]] | None) -> list[dict[str, Tenso
     if state is None:
         return None
     return [{k: v.detach() for k, v in st.items()} for st in state]
-
-
-def _mean_sparsity(state: list[dict[str, Tensor]] | None) -> Tensor | None:
-    if not state:
-        return None
-    rates = []
-    for st in state:
-        mem = st.get("mem")
-        mq = st.get("mq")
-        if mq is not None:
-            rates.append(mq.detach().float().mean())
-        if mem is not None:
-            rates.append((mem.detach() == 0).float().mean())
-    if not rates:
-        return None
-    return torch.stack(rates).mean()

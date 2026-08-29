@@ -6,6 +6,7 @@ import torch
 from torch import Tensor, nn
 
 from atomspike.config import EncoderConfig
+from atomspike.models.activations import Act
 
 
 class ResidualBlock(nn.Module):
@@ -13,12 +14,13 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.act = nn.ReLU(inplace=True)
+        self.act1 = Act("relu")
+        self.act2 = Act("relu")
 
     def forward(self, x: Tensor) -> Tensor:
-        h = self.act(self.conv1(x))
+        h = self.act1(self.conv1(x))
         h = self.conv2(h)
-        return self.act(x + h)
+        return self.act2(x + h)
 
 
 class VisualEncoder(nn.Module):
@@ -29,13 +31,13 @@ class VisualEncoder(nn.Module):
         c1, c2, c3 = cfg.stem_channels
         self.stem = nn.Sequential(
             nn.Conv2d(cfg.in_channels, c1, 3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
+            Act("relu"),
             ResidualBlock(c1),
             nn.Conv2d(c1, c2, 3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
+            Act("relu"),
             ResidualBlock(c2),
             nn.Conv2d(c2, c3, 3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
+            Act("relu"),
             ResidualBlock(c3),
         )
         self.proj = nn.Conv2d(c3, cfg.d_model, 1)
