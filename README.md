@@ -33,6 +33,8 @@ LIF 膜电位跨 30Hz tick 保持，与「按下 / 持续 / 释放」同构；�
 
 动作 slot：`W A S D` 各 4 态（idle/press/hold/release）+ `dx dy` 量化 bin + `LMB RMB` 4 态。
 
+两个可交换的实现点：激活统一走 `models/activations.py::Act`，spike 开关以 buffer 存盘，T6 转换后加载不蒸发；自注意力是 `models/attention.py::MultiHeadSelfAttention`，显式拆分 Q/K/V Linear，使 T4 LoRA 有真实的包装目标、T6 可对注意力打阈值。
+
 ## 目录
 
 ```
@@ -40,13 +42,14 @@ src/
 ├── atomspike/
 │   ├── capture/       屏幕捕获、演示录制、研究环境注入（默认关闭）
 │   ├── data/          HDF5 三元组、时间戳对齐、RA-BC / 覆盖度重加权
-│   ├── models/        encoder / reasoner / temporal adapter / ANN+脉冲策略
+│   ├── models/        encoder / reasoner / attention / activations / temporal / 策略头
 │   ├── train/         BC → 离线 RL → LoRA PEFT → 蒸馏
 │   ├── convert/       PMSM、SpikedAttention 免训练转换
 │   ├── envs/          synthetic、可选 vizdoom
 │   ├── eval/          成功率、延迟 p95、token 准确率、能耗代理
-│   ├── runtime/       双频推理循环
+│   ├── runtime/       双频时钟（scheduler.py）+ 推理循环（loop.py）
 │   └── cli.py
+├── verify.py          回归：LoRA 往返 / PMSM 存盘持久 / 双频时钟
 ├── configs/           default.yaml / smoke.yaml
 ├── pyproject.toml
 └── requirements.txt
@@ -73,7 +76,7 @@ python -m atomspike info --config configs/smoke.yaml
 python -m atomspike smoke --workdir runs/smoke
 ```
 
-`verify` 会断言三件事：T4 LoRA 包装数 > 0 且 save/load 后输出不变；T6 PMSM 改变输出且加载后仍是 spike 模式；仿真时钟 30 次策略 tick 对应 5 次感知，墙钟 pace 接近 30Hz / 5Hz。
+`verify` 跑 4 组回归：T4 LoRA 包装数 > 0 且 save/load 后输出不变；T6 PMSM 改变输出且存盘再加载后仍是 spike 模式；仿真时钟 30 次策略 tick 对应 5 次感知；realtime pace 墙钟接近 30Hz / 5Hz。
 
 分步：
 
