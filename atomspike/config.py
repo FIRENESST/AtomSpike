@@ -101,9 +101,24 @@ class TrainConfig:
     epochs: int = 10
     num_workers: int = 0
     grad_clip: float = 1.0
+    grad_accum: int = 1  # micro-batches to accumulate before optimizer.step
     seed: int = 0
     device: str = "auto"
-    precision: Precision = "fp32"
+    precision: Precision = "bf16"
+    compile: bool = False  # torch.compile the agent before training
+    compile_mode: str = "default"
+    # WSD schedule (fractions of total optimizer steps)
+    lr_schedule: Literal["constant", "wsd"] = "wsd"
+    wsd_warmup_frac: float = 0.05
+    wsd_decay_frac: float = 0.10
+    wsd_decay: Literal["linear", "cosine"] = "linear"
+    # Optimizer
+    optimizer: Literal["adamw", "muon", "muon_adamw"] = "adamw"
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    # Checkpointing
+    ckpt_keep_k: int = 3
+    ckpt_verify: bool = True
     kl_coef: float = 0.1
     advantage_temp: float = 1.0
     lora_r: int = 8

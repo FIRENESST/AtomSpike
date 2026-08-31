@@ -6,16 +6,20 @@
 
 ## 相对文档的优化
 
-| 文档原方案 | 这里的更优解 | 原因 |
-|---|---|---|
-| 感知 5Hz / 策略 30Hz，策略只吃缓存特征 | 5Hz 推理 + **30Hz 时序残差适配器**（当前帧与帧差） | 200ms 视觉冻结对瞄准/走位过钝，残差只增加极少算力 |
-| 8-token 用完整 Transformer 解码器 | 默认 **GRU 自回归**（可选 parallel / transformer_ar） | 8 步依赖够用 GRU，30Hz 延迟更稳 |
-| 从零训 SNN 或全程代理梯度 | 感知用可切换的 `Act`；默认 **脉冲策略头**；T6 把 `Act` 的 spike 开关写入 buffer，**存盘后再加载仍是 SNN** | 以前替换 nn.ReLU 后 load 回 ANN，转换结果会蒸发 |
-| 在线 RL 占卡采样 | **优势加权 BC + KL 锚定教师**（AW-BC / SPAG 离线精神） | 单机双卡也不该让采样绑死训练卡 |
-| 逐游戏全参微调 | 冻 CNN 骨干 + 推理层 **显式 Q/K/V Linear 上的 LoRA**（存盘可还原） | 以前匹配 `in_proj` 名字，对融合 MHA 包装数为 0 |
-| 必须装 ViZDoom 才能开发 | **SyntheticAimEnv** 闭环（走位 + 瞄准 + 点击） | 笔记本 CPU 即可验证数据/训练/转换/评测 |
-| 单 one-hot 组合动作 | 8 slot：4 键状态机 + 量化鼠标 + 2 鼠标键，**非法转移 mask** | 并发按键不爆炸词表，press/hold/release 合法 |
-| 「每 6 次 forward 更新上下文」 | **DualRateClock**：仿真时钟按 1/30s 推进；`play` 按墙钟 sleep 到 30Hz | 紧循环 eval 不是 30Hz；调度必须基于时间 |
+| 文档原方案                       | 这里的更优解                                                                     | 原因                                |
+| --------------------------- | -------------------------------------------------------------------------- | --------------------------------- |
+| 感知 5Hz / 策略 30Hz，策略只吃缓存特征   | 5Hz 推理 + **30Hz 时序残差适配器**（当前帧与帧差）                                          | 200ms 视觉冻结对瞄准/走位过钝，残差只增加极少算力      |
+| 8-token 用完整 Transformer 解码器 | 默认 **GRU 自回归**（可选 parallel / transformer\_ar）                              | 8 步依赖够用 GRU，30Hz 延迟更稳             |
+| 从零训 SNN 或全程代理梯度             | 感知用可切换的 `Act`；默认 **脉冲策略头**；T6 把 `Act` 的 spike 开关写入 buffer，**存盘后再加载仍是 SNN** | 以前替换 nn.ReLU 后 load 回 ANN，转换结果会蒸发 |
+| 在线 RL 占卡采样                  | **优势加权 BC + KL 锚定教师**（AW-BC / SPAG 离线精神）                                   | 单机双卡也不该让采样绑死训练卡                   |
+| 逐游戏全参微调                     | 冻 CNN 骨干 + 推理层 **显式 Q/K/V Linear 上的 LoRA**（存盘可还原）                          | 以前匹配 `in_proj` 名字，对融合 MHA 包装数为 0  |
+| 必须装 ViZDoom 才能开发            | **SyntheticAimEnv** 闭环（走位 + 瞄准 + 点击）                                       | 笔记本 CPU 即可验证数据/训练/转换/评测           |
+| 单 one-hot 组合动作              | 8 slot：4 键状态机 + 量化鼠标 + 2 鼠标键，**非法转移 mask**                                 | 并发按键不爆炸词表，press/hold/release 合法   |
+| 「每 6 次 forward 更新上下文」       | **DualRateClock**：仿真时钟按 1/30s 推进；`play` 按墙钟 sleep 到 30Hz                   | 紧循环 eval 不是 30Hz；调度必须基于时间         |
+| 单一固定学习率                    | **WSD 三阶段调度**（5% warmup / 85% stable / 10% decay），可任意中断出货              | 稳定期任意存档+补一段 decay 即可用，训练不怕断电    |
+| 默认 fp32                       | **bf16 混合精度**（CUDA + CPU autocast），可选 `torch.compile`                       | 16GB 单卡装下更大 batch；吞吐 2-3 倍           |
+| 普通 AdamW                      | **Muon + AdamW 混合**（矩阵参数走 Muon，标量/LayerNorm 走 AdamW）                       | 矩阵优化快 1.3-1.4 倍；优化器状态省 75%        |
+| 只存模型权重                      | **5 状态原子检查点**：模型+优化器+LR 调度+RNG+DataLoader，先写 .tmp 再 rename，keep-k 滚动 | 断电/中断随时续训，不会出现半个文件              |
 
 LIF 膜电位跨 30Hz tick 保持，与「按下 / 持续 / 释放」同构；转换后的稀疏度作为能耗代理，而不是假设普通 GPU 上 SNN 一定更快。
 
@@ -43,7 +47,7 @@ src/
 │   ├── capture/       屏幕捕获、演示录制、研究环境注入（默认关闭）
 │   ├── data/          HDF5 三元组、时间戳对齐、RA-BC / 覆盖度重加权
 │   ├── models/        encoder / reasoner / attention / activations / temporal / 策略头
-│   ├── train/         BC → 离线 RL → LoRA PEFT → 蒸馏
+│   ├── train/         BC → 离线 RL → LoRA PEFT → 蒸馏；optim.py（Muon+AdamW）/ sched.py（WSD）/ common.py（5 状态原子检查点）
 │   ├── convert/       PMSM、SpikedAttention 免训练转换
 │   ├── envs/          synthetic、可选 vizdoom
 │   ├── eval/          成功率、延迟 p95、token 准确率、能耗代理
@@ -94,15 +98,41 @@ python -m atomspike play --ckpt runs/snn.pt --episodes 2
 
 ## 硬件角色（与文档一致）
 
-- 96GB 卡：骨干预训练、逐游戏 LoRA、T6 转换实验
-- 16GB 卡：环境评估、自博弈采样、30Hz 延迟测试
-- 不做不对等双卡 DDP；7B+ 仅在大卡上 QLoRA（本 MVP 骨干约 1M 级，对标 DOOM 小模型）
+* 96GB 卡：骨干预训练、逐游戏 LoRA、T6 转换实验
+
+* 16GB 卡：环境评估、自博弈采样、30Hz 延迟测试
+
+* 不做不对等双卡 DDP；7B+ 仅在大卡上 QLoRA（本 MVP 骨干约 1M 级，对标 DOOM 小模型）
+
+## 训练基建（低算力高效率）
+
+本实现按「单卡 16GB 闭环」设计训练基建，但所有机制不限定具体显卡型号——任何同级消费卡都能复用：
+
+- **5 状态原子检查点**：模型 + 优化器 + LR 调度 + RNG + DataLoader。先写 `.tmp` 再 `os.replace` + SHA-256 校验，断电不会出现半个文件；keep-k 滚动（默认 3）+ best 额外存。
+- **WSD 三阶段 LR**：5% warmup / 85% stable / 10% decay。稳定期任意存档都能补一段 decay 出货，训练随时可中断。
+- **Muon + AdamW 混合**：2D 权重矩阵走 Muon（Newton-Schulz 正交化动量），bias/LayerNorm/标量走 AdamW。
+- **bf16 混合精度**：默认开启，CUDA/CPU 都通过 `torch.autocast`；可选 `torch.compile`（默认关，配置开）。
+- **梯度累积**：`grad_accum > 1` 时 micro-batch 累积后再 `optimizer.step()`，数学等价大 batch。
+
+在 `configs/*.yaml` 里通过 `train.*` 配置：
+
+```yaml
+train:
+  precision: bf16         # fp32 / fp16 / bf16
+  compile: false          # torch.compile
+  optimizer: adamw        # adamw / muon / muon_adamw
+  lr_schedule: wsd        # constant / wsd
+  wsd_warmup_frac: 0.05
+  wsd_decay_frac: 0.10
+  grad_accum: 1
+  ckpt_keep_k: 3
+```
 
 ## 指标
 
-| 维度 | 命令 | 目标 |
-|---|---|---|
-| 控制 | `eval` success_rate | 对标专家 / 公开基线 |
-| 时序 | expert_token_acc | 与 ANN 差距 ≤ 5% |
-| 实时 | `eval` scheduled_*_hz / `play` policy_hz | 仿真 30/5Hz；play 墙钟 ≈30Hz |
-| 效率 | convert 的 sparsity | 低于 dense ANN 的代理能耗 |
+| 维度 | 命令                                           | 目标                      |
+| -- | -------------------------------------------- | ----------------------- |
+| 控制 | `eval` success\_rate                         | 对标专家 / 公开基线             |
+| 时序 | expert\_token\_acc                           | 与 ANN 差距 ≤ 5%           |
+| 实时 | `eval` scheduled\_\*\_hz / `play` policy\_hz | 仿真 30/5Hz；play 墙钟 ≈30Hz |
+| 效率 | convert 的 sparsity                           | 低于 dense ANN 的代理能耗      |

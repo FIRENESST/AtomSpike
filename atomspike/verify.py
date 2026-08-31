@@ -44,7 +44,7 @@ def check_pmsm_survives_save(cfg_path: Path) -> dict:
         raise AssertionError("PMSM status enabled=False after convert")
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "snn.pt"
-        save_checkpoint(agent, path, extra={"pmsm": {"enabled": True, "threshold": 0.05}})
+        save_checkpoint(agent, path, extra={"pmsm": {"enabled": True, "threshold": 0.05}}, verify=False)
         loaded = load_agent(path, cfg, device)
     status = pmsm_status(loaded)
     if not status["enabled"]:
@@ -73,7 +73,7 @@ def check_lora_roundtrip(cfg_path: Path) -> dict:
     y = _logits(agent, frames, state)
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "peft.pt"
-        save_checkpoint(agent, path)
+        save_checkpoint(agent, path, verify=False)
         loaded = load_agent(path, cfg, device)
     if not any(isinstance(m, LoRALinear) for m in loaded.reasoner.modules()):
         raise AssertionError("LoRA wrappers missing after load")
