@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from atomspike.config import EncoderConfig
@@ -43,6 +44,8 @@ class VisualEncoder(nn.Module):
         self.proj = nn.Conv2d(c3, cfg.d_model, 1)
         self.d_model = cfg.d_model
         self.frame_size = cfg.frame_size
+        self.max_token_h = int(cfg.max_token_h)
+        self.max_token_w = int(cfg.max_token_w)
 
     def forward(self, frames: Tensor) -> tuple[Tensor, Tensor]:
         """frames: [B, C, H, W] float in [0, 1] or uint8."""
@@ -52,6 +55,10 @@ class VisualEncoder(nn.Module):
             frames = frames.float()
         h = self.stem(frames)
         h = self.proj(h)
+        gh, gw = int(h.shape[-2]), int(h.shape[-1])
+        max_h, max_w = self.max_token_h, self.max_token_w
+        if max_h > 0 and max_w > 0 and (gh > max_h or gw > max_w):
+            h = F.adaptive_avg_pool2d(h, (min(gh, max_h), min(gw, max_w)))
         b, d, gh, gw = h.shape
         tokens = h.flatten(2).transpose(1, 2).contiguous()  # [B, HW, D]
         pooled = tokens.mean(dim=1)

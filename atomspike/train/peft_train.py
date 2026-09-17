@@ -44,7 +44,8 @@ def train_peft(
     if train_n <= 0:
         raise RuntimeError("T4 LoRA left 0 trainable parameters")
     agent = maybe_compile(agent, cfg)
-    ds = H5DemoDataset(data_path)
+    ds = H5DemoDataset.from_config(data_path, cfg)
+    ds.assert_matches(cfg)
     loader = make_loader(ds, cfg)
     opt = build_optimizer(cfg.train, (p for p in agent.parameters() if p.requires_grad))
     n_epochs = cfg.train.epochs if epochs is None else epochs
@@ -63,8 +64,9 @@ def train_peft(
             prev = batch["prev_frame"].to(device, non_blocking=True)
             state = batch["game_state"].to(device, non_blocking=True)
             tokens = batch["action"].to(device, non_blocking=True)
+            clock = batch["clock"].to(device, non_blocking=True) if "clock" in batch else None
             with autocast_ctx(device, cfg.train.precision):
-                out = agent(frames, state, tokens=tokens, prev_frames=prev, reason_tick=True)
+                out = agent(frames, state, tokens=tokens, prev_frames=prev, reason_tick=True, clock=clock)
                 loss = action_ce_loss(out["logits"], tokens) / accum
             loss.backward()
             if (step + 1) % accum == 0 or (step + 1) == len(loader):
@@ -109,7 +111,8 @@ def distill_ann_to_small(
     teacher.eval()
     student = AtomSpikeAgent(student_cfg).to(device)
     student = maybe_compile(student, cfg)
-    ds = H5DemoDataset(data_path)
+    ds = H5DemoDataset.from_config(data_path, student_cfg)
+    ds.assert_matches(student_cfg)
     loader = make_loader(ds, cfg)
     opt = build_optimizer(cfg.train, student.parameters())
     n_epochs = cfg.train.epochs if epochs is None else epochs

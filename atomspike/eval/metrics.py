@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 
 from atomspike.config import AtomSpikeConfig
 from atomspike.convert.pmsm import pmsm_status
+from atomspike.data.io import H5DemoDataset
 from atomspike.envs import make_env
 from atomspike.models.agent import AtomSpikeAgent
 from atomspike.runtime.loop import DualRateLoop
@@ -89,6 +90,84 @@ def evaluate_policy(
         "expert_token_acc": float(np.mean(expert_match) if expert_match else 0.0),
         "episodes": episodes,
         "params": agent.parameter_count(),
+    }
+
+
+@torch.no_grad()
+def evaluate_offline(
+    cfg: AtomSpikeConfig,
+    ckpt: str | Path,
+    data_path: str | Path,
+    max_steps: int | None = None,
+) -> dict:
+    """Token accuracy on recorded demos. Used when there is no scripted env (Minecraft)."""
+    device = resolve_device(cfg.train.device)
+    agent = load_agent(ckpt, cfg, device)
+    agent.eval()
+    ds = H5DemoDataset.from_config(data_path, cfg)
+    ds.assert_matches(cfg)
+    n = len(ds) if max_steps is None else min(len(ds), int(max_steps))
+    batch_size = max(1, int(cfg.train.batch_size))
+    pred_all: list[np.ndarray] = []
+    tgt_all: list[np.ndarray] = []
+    gui_all: list[np.ndarray] = []
+    t0 = time.perf_counter()
+    for start in range(0, n, batch_size):
+        sl = range(start, min(start + batch_size, n))
+        frames = torch.stack([torch.from_numpy(ds[j]["frame"]) for j in sl]).to(device)
+        prev = torch.stack([torch.from_numpy(ds[j]["prev_frame"]) for j in sl]).to(device)
+        state = torch.stack([torch.from_numpy(ds[j]["game_state"]) for j in sl]).to(device)
+        tgt = torch.stack([torch.from_numpy(ds[j]["action"]) for j in sl]).to(device)
+        clock = torch.stack([torch.from_numpy(ds[j]["clock"]) for j in sl]).to(device)
+        out = agent(frames, state, prev_frames=prev, reason_tick=True, clock=clock)
+        pred = torch.stack([lg.argmax(dim=-1) for lg in out["logits"]], dim=1)
+        pred_all.append(pred.cpu().numpy())
+        tgt_all.append(tgt.cpu().numpy())
+        if ds.gui_index is not None:
+            gui_all.append(state[:, ds.gui_index].cpu().numpy())
+    pred = np.concatenate(pred_all)
+    tgt = np.concatenate(tgt_all)
+    eq = pred == tgt
+    slot_acc = eq.mean(axis=0).tolist()
+    names = list(agent.spec.key_names) + ["mouse_x", "mouse_y"] + ["LMB", "RMB"][: agent.spec.n_mouse_buttons]
+    slot_named = {names[i] if i < len(names) else f"slot{i}": float(slot_acc[i]) for i in range(len(slot_acc))}
+    mx_i = agent.spec.n_keys
+    center = int(agent.spec.mouse_center)
+    gui_acc = look_acc = gui_mouse = look_mouse = None
+    look_mouse_move = look_mouse_sign = None
+    if gui_all:
+        gui = np.concatenate(gui_all) > 0.5
+        if gui.any():
+            gui_acc = float(eq[gui].mean())
+            gui_mouse = [float(eq[gui, mx_i].mean()), float(eq[gui, mx_i + 1].mean())]
+        look = ~gui
+        if look.any():
+            look_acc = float(eq[look].mean())
+            look_mouse = [float(eq[look, mx_i].mean()), float(eq[look, mx_i + 1].mean())]
+            moving = look & ((tgt[:, mx_i] != center) | (tgt[:, mx_i + 1] != center))
+            if moving.any():
+                look_mouse_move = [float(eq[moving, mx_i].mean()), float(eq[moving, mx_i + 1].mean())]
+            look_mouse_sign = [
+                float((np.sign(pred[look, mx_i] - center) == np.sign(tgt[look, mx_i] - center)).mean()),
+                float((np.sign(pred[look, mx_i + 1] - center) == np.sign(tgt[look, mx_i + 1] - center)).mean()),
+            ]
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0 / max(1, n)
+    status = pmsm_status(agent)
+    return {
+        "token_acc": float(eq.mean()),
+        "n": int(n),
+        "slot_acc": slot_named,
+        "gui_acc": gui_acc,
+        "look_acc": look_acc,
+        "gui_mouse_acc": gui_mouse,
+        "look_mouse_acc": look_mouse,
+        "look_mouse_move_acc": look_mouse_move,
+        "look_mouse_sign_acc": look_mouse_sign,
+        "ms_per_step": elapsed_ms,
+        "pmsm_enabled": status["enabled"],
+        "params": agent.parameter_count(),
+        "mouse_bins": int(agent.spec.mouse_bins),
+        "data": str(data_path),
     }
 
 

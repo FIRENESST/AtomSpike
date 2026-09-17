@@ -20,6 +20,27 @@ class CaptureConfig:
     monitor: int = 1
     region: tuple[int, int, int, int] | None = None
     jpeg_quality: int = 90
+    window_title: str = "Minecraft"
+    store_width: int = 854
+    store_height: int = 480
+    client_only: bool = True
+
+
+@dataclass
+class MinecraftConfig:
+    """Human 30fps collector for local / research Minecraft sessions."""
+
+    window_title: str = "Minecraft"
+    sidecar_host: str = "127.0.0.1"
+    sidecar_udp_port: int = 21337
+    sidecar_path: str = ""
+    saves_dir: str = ""
+    poll_saves_hz: float = 2.0
+    hud_probe: bool = True
+    record_input: bool = True
+    stop_key: str = "F9"
+    mark_key: str = "F8"
+    state_dim: int = 19
 
 
 @dataclass
@@ -28,6 +49,8 @@ class EncoderConfig:
     stem_channels: tuple[int, int, int] = (16, 32, 64)
     d_model: int = 128
     frame_size: int = 84
+    max_token_h: int = 24
+    max_token_w: int = 40
 
 
 @dataclass
@@ -65,13 +88,40 @@ class PolicyConfig:
 
 
 @dataclass
+class PlannerConfig:
+    """Invented task slots, inferred importance, self-arranged successor."""
+
+    enabled: bool = True
+    latent_dim: int = 64
+    hidden: int = 128
+    n_phases: int = 16
+    n_plan_tokens: int = 2
+    future_steps: int = 15
+    future_near: int = 5
+    future_far: int = 45
+    session_gap_s: float = 2.0
+    kl_coef: float = 0.01
+    phase_coef: float = 0.0
+    next_coef: float = 0.4
+    future_coef: float = 0.2
+    time_coef: float = 0.12
+    mono_coef: float = 0.0
+    div_coef: float = 0.05
+    arrange: float = 0.7
+    creative: bool = True
+    explore: float = 0.08
+
+
+@dataclass
 class ActionConfig:
     n_keys: int = 4
     key_names: tuple[str, ...] = ("W", "A", "S", "D")
     n_key_states: int = 4  # idle / press / hold / release
-    mouse_bins: int = 21  # quantized dx/dy in [-10, 10]
+    mouse_bins: int = 21  # look / GUI cursor quantization
     n_mouse_buttons: int = 2
     n_slots: int = 8
+    mouse_delta_max: float = 10.0
+    mouse_delta_scale: float = 4.0
 
 
 ClockMode = Literal["sim", "realtime"]
@@ -124,11 +174,16 @@ class TrainConfig:
     lora_r: int = 8
     lora_alpha: int = 16
     log_wandb: bool = False
+    val_frac: float = 0.0
+    gui_sample_weight: float = 1.0
+    motion_sample_weight: float = 1.0
+    look_move_ce_boost: float = 4.0
+    slot_balance: bool = False
 
 
 @dataclass
 class EnvConfig:
-    kind: str = "synthetic"
+    kind: str = "minecraft"
     max_steps: int = 128
     frame_size: int = 84
     seed: int = 0
@@ -148,11 +203,13 @@ class AtomSpikeConfig:
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     reasoner: ReasonerConfig = field(default_factory=ReasonerConfig)
     adapter: TemporalAdapterConfig = field(default_factory=TemporalAdapterConfig)
+    planner: PlannerConfig = field(default_factory=PlannerConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     action: ActionConfig = field(default_factory=ActionConfig)
     dual_rate: DualRateConfig = field(default_factory=DualRateConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
+    minecraft: MinecraftConfig = field(default_factory=MinecraftConfig)
     convert: ConvertConfig = field(default_factory=ConvertConfig)
 
     def aligned(self) -> "AtomSpikeConfig":
@@ -162,6 +219,11 @@ class AtomSpikeConfig:
         self.adapter.d_model = d
         self.policy.d_model = d
         self.env.frame_size = self.encoder.frame_size
+        self.action.n_slots = self.action.n_keys + 2 + self.action.n_mouse_buttons
+        mc_kinds = {"minecraft", "mc", "minerl"}
+        if self.env.kind.lower() in mc_kinds:
+            self.reasoner.game_state_dim = max(self.reasoner.game_state_dim, self.minecraft.state_dim)
+            self.capture.window_title = self.minecraft.window_title or self.capture.window_title
         if self.policy.n_heads < 1 or d % self.policy.n_heads != 0:
             for h in (8, 4, 2, 1):
                 if d % h == 0:

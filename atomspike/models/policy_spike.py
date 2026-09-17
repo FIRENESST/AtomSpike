@@ -7,6 +7,7 @@ runtime uses one step per policy tick with persistent membrane.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 
@@ -42,7 +43,7 @@ class SpikeSelfAttention(nn.Module):
         attn = attn.softmax(dim=-1)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).reshape(b, n, d)
-        return self.out(out), mem_q, mem_k
+        return self.out(out), mem_q, mem_k, q_s, k_s
 
 
 class SpikeBlock(nn.Module):
@@ -60,12 +61,12 @@ class SpikeBlock(nn.Module):
 
     def forward(self, x: Tensor, state: dict[str, Tensor] | None):
         state = state or {}
-        h, mq, mk = self.attn(self.norm1(x), state.get("mq"), state.get("mk"))
+        h, mq, mk, q_s, k_s = self.attn(self.norm1(x), state.get("mq"), state.get("mk"))
         x = x + h
         mlp_out = self.mlp(self.norm2(x))
         spike, mem = self.lif(mlp_out, state.get("mem"))
         x = x + spike
-        return x, {"mq": mq, "mk": mk, "mem": mem}
+        return x, {"mq": mq, "mk": mk, "mem": mem, "q_s": q_s, "k_s": k_s, "spike": spike}
 
 
 class SpikePolicy(nn.Module):
@@ -81,10 +82,14 @@ class SpikePolicy(nn.Module):
         self.value_head = nn.Linear(cfg.d_model, 1)
         self._state: list[dict[str, Tensor]] | None = None
         self._in_mem: Tensor | None = None
+        self.trace_enabled = False
+        self.last_trace: dict | None = None
+        self.v_th = float(cfg.lif_v_th)
 
     def reset_state(self) -> None:
         self._state = None
         self._in_mem = None
+        self.last_trace = None
 
     def forward(self, context: Tensor, tokens: Tensor | None = None) -> dict[str, object]:
         x = context.unsqueeze(1)  # [B, 1, D]
@@ -97,17 +102,37 @@ class SpikePolicy(nn.Module):
                 state, in_mem = None, None
             steps = 1
         spike_rates: list[Tensor] = []
+        want_trace = bool(self.trace_enabled) and (not self.training)
+        last_in_spike: Tensor | None = None
+        last_in_mem: Tensor | None = None
+        last_layers: list[dict] = []
         for _ in range(steps):
             spiked, in_mem = self.in_lif(x, in_mem)
             spike_rates.append(spiked.detach().float().mean())
+            last_in_spike, last_in_mem = spiked, in_mem
             h = spiked
             new_state: list[dict[str, Tensor]] = []
+            last_layers = []
             for i, block in enumerate(self.blocks):
                 st = None if state is None else state[i]
                 h, st_out = block(h, st)
-                new_state.append(st_out)
-                if st_out.get("mq") is not None:
-                    spike_rates.append(st_out["mq"].detach().float().mean())
+                persist = {k: st_out[k] for k in ("mq", "mk", "mem") if k in st_out}
+                new_state.append(persist)
+                if st_out.get("q_s") is not None:
+                    spike_rates.append(st_out["q_s"].detach().float().mean())
+                if st_out.get("spike") is not None:
+                    spike_rates.append(st_out["spike"].detach().float().mean())
+                if want_trace:
+                    last_layers.append(
+                        {
+                            "mem": _vec(st_out.get("mem")),
+                            "spike": _vec(st_out.get("spike")),
+                            "q_s": _vec(st_out.get("q_s")),
+                            "k_s": _vec(st_out.get("k_s")),
+                            "q_mem": _vec(st_out.get("mq")),
+                            "k_mem": _vec(st_out.get("mk")),
+                        }
+                    )
             x = h
             state = new_state
         if not self.training:
@@ -117,10 +142,29 @@ class SpikePolicy(nn.Module):
         logits = self.decoder(pooled, tokens)
         value = self.value_head(pooled).squeeze(-1)
         sparsity = torch.stack(spike_rates).mean() if spike_rates else pooled.new_zeros(())
+        if want_trace:
+            self.last_trace = {
+                "kind": "spike",
+                "in_spike": _vec(last_in_spike),
+                "in_mem": _vec(last_in_mem),
+                "layers": last_layers,
+                "sparsity": float(sparsity.detach().float().item()),
+                "v_th": float(self.v_th),
+            }
         return {"logits": logits, "value": value, "spikes": sparsity}
+
+
+def _vec(t: Tensor | None) -> np.ndarray:
+    if t is None:
+        return np.zeros(1, dtype=np.float32)
+    x = t.detach().float()
+    if x.ndim >= 1:
+        x = x[0]
+    return np.ascontiguousarray(x.reshape(-1).cpu().numpy(), dtype=np.float32)
 
 
 def _detach_state(state: list[dict[str, Tensor]] | None) -> list[dict[str, Tensor]] | None:
     if state is None:
         return None
-    return [{k: v.detach() for k, v in st.items()} for st in state]
+    keep = ("mq", "mk", "mem")
+    return [{k: v.detach() for k, v in st.items() if k in keep} for st in state]

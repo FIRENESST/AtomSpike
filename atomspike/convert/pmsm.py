@@ -101,7 +101,7 @@ def convert_checkpoint(
     device = resolve_device(cfg.train.device)
     agent = load_agent(ckpt_path, cfg, device)
     if data_path is not None and Path(data_path).exists():
-        ds = H5DemoDataset(data_path)
+        ds = H5DemoDataset.from_config(data_path, cfg)
         n = min(8, len(ds))
         frames = torch.stack([torch.as_tensor(ds[i]["frame"]) for i in range(n)]).to(device)
         state = torch.stack([torch.as_tensor(ds[i]["game_state"]) for i in range(n)]).to(device)

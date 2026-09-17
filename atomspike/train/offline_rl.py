@@ -48,7 +48,8 @@ def train_offline_rl(
 ) -> dict:
     set_seed(cfg.train.seed)
     device = resolve_device(cfg.train.device)
-    ds = H5DemoDataset(data_path)
+    ds = H5DemoDataset.from_config(data_path, cfg)
+    ds.assert_matches(cfg)
     loader = make_loader(ds, cfg)
     agent = load_agent(teacher_ckpt, cfg, device)
     agent = maybe_compile(agent, cfg)
@@ -77,10 +78,11 @@ def train_offline_rl(
             state = batch["game_state"].to(device, non_blocking=True)
             tokens = batch["action"].to(device, non_blocking=True)
             reward = batch["reward"].to(device, non_blocking=True)
+            clock = batch["clock"].to(device, non_blocking=True) if "clock" in batch else None
             with autocast_ctx(device, cfg.train.precision):
-                out = agent(frames, state, tokens=tokens, prev_frames=prev, reason_tick=True)
+                out = agent(frames, state, tokens=tokens, prev_frames=prev, reason_tick=True, clock=clock)
                 with torch.no_grad():
-                    t_out = teacher(frames, state, tokens=tokens, prev_frames=prev, reason_tick=True)
+                    t_out = teacher(frames, state, tokens=tokens, prev_frames=prev, reason_tick=True, clock=clock)
                     t_lp = _logprob(t_out["logits"], tokens)
                     adv = reward - out["value"].detach().float()
                     w = torch.exp((adv / max(cfg.train.advantage_temp, 1e-3)).clamp(-8, 8))

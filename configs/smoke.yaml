@@ -13,6 +13,21 @@ adapter:
   enabled: true
   hidden: 16
 
+planner:
+  enabled: true
+  latent_dim: 32
+  hidden: 64
+  n_phases: 8
+  n_plan_tokens: 2
+  future_steps: 4
+  future_near: 2
+  future_far: 6
+  session_gap_s: 2.0
+  time_coef: 0.12
+  arrange: 0.7
+  creative: false
+  explore: 0.0
+
 policy:
   kind: spike
   n_layers: 1
@@ -21,6 +36,8 @@ policy:
   spike_time_steps: 1
 
 action:
+  n_keys: 4
+  key_names: [W, A, S, D]
   mouse_bins: 11
 
 dual_rate:

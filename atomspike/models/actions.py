@@ -1,20 +1,22 @@
-"""8-token atomic action space (keyboard + quantized mouse).
+"""8–12 slot atomic action space (keyboard + quantized mouse).
 
-Slots
------
-0-3  keyboard keys (idle / press / hold / release)
-4-5  mouse dx, dy quantized bins
-6-7  mouse buttons (idle / press / hold / release)
+Slots (n_keys=8 Minecraft default after aligned())
+-------------------------------------------------
+0-7   WASD SPACE SHIFT CTRL E  (idle / press / hold / release)
+8-9   look: mouse dx/dy bins; inventory/GUI: window-normalized cursor x/y
+10-11 LMB RMB (idle / press / hold / release). Shift-click = SHIFT key + LMB.
 
-This is closer to Game-TARS device-level actions than a one-hot combo
-classifier, and keeps multi-key concurrency without an exponential vocab.
+Smoke / synthetic keeps n_keys=4 → 8 slots total.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
+import numpy as np
 import torch
+from numpy.typing import NDArray
 from torch import Tensor
 
 from atomspike.config import ActionConfig
@@ -31,16 +33,25 @@ class ActionSpec:
     n_mouse_buttons: int
     key_names: tuple[str, ...]
     n_slots: int = 8
+    mouse_delta_max: float = 10.0
+    mouse_delta_scale: float = 4.0
 
     @classmethod
     def from_config(cls, cfg: ActionConfig) -> "ActionSpec":
+        names = tuple(cfg.key_names)
+        if len(names) < cfg.n_keys:
+            names = names + tuple(f"K{i}" for i in range(len(names), cfg.n_keys))
+        elif len(names) > cfg.n_keys:
+            names = names[: cfg.n_keys]
         return cls(
             n_keys=cfg.n_keys,
             n_key_states=cfg.n_key_states,
             mouse_bins=cfg.mouse_bins,
             n_mouse_buttons=cfg.n_mouse_buttons,
-            key_names=tuple(cfg.key_names),
+            key_names=names,
             n_slots=cfg.n_slots,
+            mouse_delta_max=float(cfg.mouse_delta_max),
+            mouse_delta_scale=float(cfg.mouse_delta_scale),
         )
 
     @property
@@ -72,14 +83,41 @@ class ActionSpec:
         btns = (KEY_IDLE,) * self.n_mouse_buttons
         return keys + mouse + btns
 
-    def mouse_delta_to_bin(self, delta: float, max_abs: float = 10.0) -> int:
-        clamped = max(-max_abs, min(max_abs, float(delta)))
-        scaled = (clamped / max_abs) * self.mouse_radius
-        return int(round(scaled + self.mouse_center))
+    def mouse_delta_to_bin(self, delta: float, max_abs: float | None = None) -> int:
+        """Compress look deltas with asinh so flicks do not all saturate the last bin."""
+        arr = self.mouse_deltas_to_bins(np.asarray([delta], dtype=np.float64), max_abs=max_abs)
+        return int(arr[0])
 
-    def bin_to_mouse_delta(self, bin_id: int, max_abs: float = 10.0) -> float:
-        centered = int(bin_id) - self.mouse_center
-        return (centered / max(1, self.mouse_radius)) * max_abs
+    def bin_to_mouse_delta(self, bin_id: int, max_abs: float | None = None) -> float:
+        max_abs = self.mouse_delta_max if max_abs is None else float(max_abs)
+        scale = max(1e-6, self.mouse_delta_scale)
+        y = (int(bin_id) - self.mouse_center) / max(1, self.mouse_radius)
+        y = max(-1.0, min(1.0, float(y)))
+        return float(scale * math.sinh(y * math.asinh(max_abs / scale)))
+
+    def mouse_deltas_to_bins(self, delta: NDArray[np.floating], max_abs: float | None = None) -> NDArray[np.int64]:
+        max_abs = self.mouse_delta_max if max_abs is None else float(max_abs)
+        scale = max(1e-6, self.mouse_delta_scale)
+        denom = max(1e-6, math.asinh(max_abs / scale))
+        y = np.arcsinh(np.asarray(delta, dtype=np.float64) / scale) / denom
+        y = np.clip(y, -1.0, 1.0)
+        bins = np.rint(y * self.mouse_radius + self.mouse_center)
+        return np.clip(bins, 0, self.mouse_bins - 1).astype(np.int64)
+
+    def mouse_units_to_bins(self, unit: NDArray[np.floating]) -> NDArray[np.int64]:
+        last = max(0, self.mouse_bins - 1)
+        u = np.clip(np.asarray(unit, dtype=np.float64), 0.0, 1.0)
+        return np.clip(np.rint(u * last), 0, last).astype(np.int64)
+
+    def mouse_unit_to_bin(self, unit: float) -> int:
+        """Map window-normalized [0, 1] cursor to a mouse-axis bin (GUI / inventory)."""
+        u = max(0.0, min(1.0, float(unit)))
+        last = max(0, self.mouse_bins - 1)
+        return int(round(u * last))
+
+    def bin_to_mouse_unit(self, bin_id: int) -> float:
+        last = max(1, self.mouse_bins - 1)
+        return float(max(0, min(last, int(bin_id)))) / float(last)
 
 
 class ActionStateMachine:
@@ -175,10 +213,64 @@ def tokens_to_controls(tokens: Tensor, spec: ActionSpec) -> dict[str, object]:
     keys = {}
     for i, name in enumerate(spec.key_names):
         keys[name] = KEY_STATE_NAMES[int(tokens[i].item())]
-    dx = spec.bin_to_mouse_delta(int(tokens[spec.n_keys].item()))
-    dy = spec.bin_to_mouse_delta(int(tokens[spec.n_keys + 1].item()))
+    mx = int(tokens[spec.n_keys].item())
+    my = int(tokens[spec.n_keys + 1].item())
+    dx = spec.bin_to_mouse_delta(mx)
+    dy = spec.bin_to_mouse_delta(my)
     buttons = {
         "LMB": KEY_STATE_NAMES[int(tokens[spec.n_keys + 2].item())],
         "RMB": KEY_STATE_NAMES[int(tokens[spec.n_keys + 3].item())],
     }
-    return {"keys": keys, "mouse": {"dx": dx, "dy": dy, "buttons": buttons}}
+    return {
+        "keys": keys,
+        "mouse": {
+            "dx": dx,
+            "dy": dy,
+            "nx": spec.bin_to_mouse_unit(mx),
+            "ny": spec.bin_to_mouse_unit(my),
+            "buttons": buttons,
+        },
+    }
+
+
+def look_deltas_from_logits(logits: list[Tensor], spec: ActionSpec) -> tuple[Tensor, Tensor]:
+    """Soft look dx/dy. Argmax on the idle bin would otherwise never turn the camera."""
+    table = torch.tensor(
+        [spec.bin_to_mouse_delta(i) for i in range(spec.mouse_bins)],
+        device=logits[spec.n_keys].device,
+        dtype=torch.float32,
+    )
+    mx = torch.softmax(logits[spec.n_keys].float(), dim=-1) @ table
+    my = torch.softmax(logits[spec.n_keys + 1].float(), dim=-1) @ table
+    return mx, my
+
+
+def retokenize_mouse_slots(
+    actions: NDArray[np.int64],
+    spec: ActionSpec,
+    *,
+    mouse_xy: NDArray[np.floating] | None = None,
+    cursor_xy: NDArray[np.floating] | None = None,
+    gui_open: NDArray[np.floating] | None = None,
+) -> NDArray[np.int64]:
+    """Rebuild mouse-axis tokens from stored high-res extras (no re-collect)."""
+    out = np.array(actions, dtype=np.int64, copy=True)
+    n = int(out.shape[0])
+    mx_i, my_i = spec.n_keys, spec.n_keys + 1
+    gui = np.zeros(n, dtype=bool)
+    if gui_open is not None:
+        gui = np.asarray(gui_open, dtype=np.float64).reshape(-1)[:n] > 0.5
+    look = ~gui
+    if mouse_xy is not None:
+        delta = np.asarray(mouse_xy, dtype=np.float64).reshape(-1, 2)[:n]
+        mag = np.hypot(delta[:, 0], delta[:, 1])
+        # HUD often flags caves/sky as inventory; raw look deltas still mean look.
+        look = look | (mag > 3.0)
+        out[look, mx_i] = spec.mouse_deltas_to_bins(delta[look, 0])
+        out[look, my_i] = spec.mouse_deltas_to_bins(delta[look, 1])
+    gui_cursor = gui & ~look
+    if cursor_xy is not None and gui_cursor.any():
+        cur = np.asarray(cursor_xy, dtype=np.float64).reshape(-1, 2)[:n]
+        out[gui_cursor, mx_i] = spec.mouse_units_to_bins(cur[gui_cursor, 0])
+        out[gui_cursor, my_i] = spec.mouse_units_to_bins(cur[gui_cursor, 1])
+    return out

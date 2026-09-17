@@ -48,6 +48,7 @@ class DualRateClock:
         self.last_policy_t = -1e9
         self.n_policy = 0
         self.n_perception = 0
+        self.idle_fn = None
         self._wall0 = time.perf_counter()
         self._slot = 0
         self._slept_s = 0.0
@@ -107,7 +108,15 @@ class DualRateClock:
         now = time.perf_counter()
         remaining = deadline - now
         if remaining > 0:
-            time.sleep(remaining)
+            if self.idle_fn is not None:
+                t0 = time.perf_counter()
+                self.idle_fn(remaining)
+                used = time.perf_counter() - t0
+                leftover = remaining - used
+                if leftover > 0.0004:
+                    time.sleep(leftover)
+            else:
+                time.sleep(remaining)
             self._slept_s += remaining
             return remaining
         return 0.0

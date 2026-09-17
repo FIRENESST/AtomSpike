@@ -6,8 +6,6 @@ from pathlib import Path
 
 from atomspike.config import AtomSpikeConfig
 from atomspike.data.io import collect_expert_demos
-from atomspike.data.rabc import rabc_weights
-from atomspike.data.io import H5DemoDataset
 from atomspike.envs import make_env
 from atomspike.train.bc import train_bc
 from atomspike.train.offline_rl import train_offline_rl
@@ -25,6 +23,11 @@ def run_pipeline(
 ) -> dict:
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+    if cfg.env.kind.lower() in {"minecraft", "mc", "minerl"}:
+        raise RuntimeError(
+            "Default target is Minecraft human capture. "
+            "Use `python -m atomspike collect-mc --out runs/mc.h5` or pass a synthetic config."
+        )
     env = make_env(
         cfg.env.kind,
         frame_size=cfg.env.frame_size,
@@ -33,9 +36,7 @@ def run_pipeline(
         action_cfg=cfg.action,
     )
     demo = collect_expert_demos(env, workdir / "demos.h5", episodes=episodes, seed=cfg.train.seed)
-    ds = H5DemoDataset(demo)
-    weights = rabc_weights(ds)
-    bc = train_bc(cfg, demo, workdir / "bc.pt", weights=weights)
+    bc = train_bc(cfg, demo, workdir / "bc.pt", rabc=True)
     result: dict = {"demo": str(demo), "bc": bc}
     teacher = bc["checkpoint"]
     if not skip_rl:

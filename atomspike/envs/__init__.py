@@ -14,4 +14,8 @@ def make_env(kind: str, **kwargs) -> GameEnv:
         from atomspike.envs.vizdoom import ViZDoomEnv
 
         return ViZDoomEnv(**kwargs)
+    if kind in {"minecraft", "mc", "minerl"}:
+        from atomspike.envs.minecraft import MinecraftHumanEnv
+
+        return MinecraftHumanEnv(**kwargs)
     raise ValueError(f"unknown env kind: {kind}")

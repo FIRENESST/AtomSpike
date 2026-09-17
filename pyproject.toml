@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-capture = ["mss>=9.0", "pynput>=1.7"]
+capture = ["mss>=9.0", "pynput>=1.7", "pygame-ce>=2.5"]
 vizdoom = ["vizdoom>=1.2"]
 wandb = ["wandb>=0.16"]
 dev = ["pytest>=7.4"]

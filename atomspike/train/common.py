@@ -48,18 +48,30 @@ def collate_demos(batch: list[dict]) -> dict[str, Tensor]:
         "reward": stack("reward", torch.float32).squeeze(-1),
         "weight": stack("weight", torch.float32).squeeze(-1),
         "done": stack("done").squeeze(-1),
+        "time_frac": stack("time_frac", torch.float32).squeeze(-1),
+        "phase": stack("phase", torch.long).squeeze(-1),
+        "next_phase": stack("next_phase", torch.long).squeeze(-1),
+        "future_state": stack("future_state", torch.float32),
+        "future_state_near": stack("future_state_near", torch.float32),
+        "future_state_far": stack("future_state_far", torch.float32),
+        "clock": stack("clock", torch.float32),
+        "session_id": stack("session_id", torch.long).squeeze(-1),
     }
 
 
-def make_loader(ds: Dataset, cfg: AtomSpikeConfig, sampler=None) -> DataLoader:
+def make_loader(ds: Dataset, cfg: AtomSpikeConfig, sampler=None, shuffle: bool | None = None) -> DataLoader:
+    pin = torch.cuda.is_available() and str(cfg.train.device) != "cpu"
+    if shuffle is None:
+        shuffle = sampler is None
     return DataLoader(
         ds,
         batch_size=cfg.train.batch_size,
-        shuffle=sampler is None,
+        shuffle=shuffle,
         sampler=sampler,
         num_workers=cfg.train.num_workers,
         collate_fn=collate_demos,
         drop_last=False,
+        pin_memory=pin,
     )
 
 
@@ -192,6 +204,12 @@ def load_checkpoint(
     handles are given. Returns the raw payload so callers can grab `loader`
     state or `extra` themselves.
     """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"checkpoint not found: {path}. "
+            "Record Minecraft demos then train-bc before predict-mc."
+        )
     try:
         ckpt = torch.load(path, map_location=device, weights_only=False)
     except TypeError:

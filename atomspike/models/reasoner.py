@@ -46,16 +46,25 @@ class SemanticReasoner(nn.Module):
         self.norm = nn.LayerNorm(cfg.d_model)
         nn.init.trunc_normal_(self.cls, std=0.02)
 
-    def forward(self, visual_tokens: Tensor, game_state: Tensor) -> Tensor:
+    def forward(
+        self,
+        visual_tokens: Tensor,
+        game_state: Tensor,
+        plan_tokens: Tensor | None = None,
+    ) -> Tensor:
         """
         visual_tokens: [B, N, D]
         game_state: [B, S]
+        plan_tokens: optional [B, P, D] self-semantic task tokens
         returns context: [B, D]
         """
         b = visual_tokens.size(0)
         state_tokens = self.state_proj(game_state).view(b, self.n_state_tokens, self.d_model)
         cls = self.cls.expand(b, -1, -1)
-        seq = torch.cat([cls, visual_tokens, state_tokens], dim=1)
+        parts = [cls, visual_tokens, state_tokens]
+        if plan_tokens is not None:
+            parts.append(plan_tokens)
+        seq = torch.cat(parts, dim=1)
         for block in self.blocks:
             seq = block(seq)
         return self.norm(seq[:, 0])
