@@ -1,0 +1,3 @@
+# The dataclass defaults are the canonical production profile. Keeping this
+# file minimal prevents installed wheels from drifting from those defaults.
+{}

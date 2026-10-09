@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +16,63 @@ from atomspike.capture.input_tap import InputTap
 from atomspike.capture.mc_state import MC_FACT_FIELDS, MC_STATE_FIELDS, MinecraftStateHub
 from atomspike.capture.window import WindowGrabber, client_cursor_norm, list_windows, pick_minecraft_window
 from atomspike.data.stream import StreamingDemoWriter
+from atomspike.data.visual_concepts import concept_from_signal
 from atomspike.models.actions import ActionSpec
+from atomspike.models.iterator import task_aux_from_signal, task_id_from_name
+from atomspike.models.inventory import inventory_pack_from_signal
+from atomspike.models.sea import BlockPulseTracker
+
+
+def _finite_signal(raw: dict, key: str) -> float | None:
+    value = raw.get(key)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if isfinite(number) else None
+
+
+@dataclass
+class ProgressRewardTracker:
+    """Sparse, auditable demonstration reward from sidecar progress signals.
+
+    This intentionally records only advancement progress and damage. It does
+    not smuggle view, camera, idle, or other online shaping into offline RL.
+    """
+
+    goal_weight: float = 1.0
+    hp_penalty: float = 0.2
+    fraction_weight: float = 0.35
+    _adv_done: float | None = None
+    _adv_frac: float | None = None
+    _hp: float | None = None
+
+    def observe(self, raw: dict) -> tuple[float, bool]:
+        adv_done = _finite_signal(raw, "adv_done")
+        adv_frac = _finite_signal(raw, "adv_next_frac")
+        hp = _finite_signal(raw, "hp")
+        reward = 0.0
+        completed = False
+        if adv_done is not None and self._adv_done is not None:
+            delta = adv_done - self._adv_done
+            if delta > 0.0:
+                reward += float(self.goal_weight) * delta
+                completed = True
+        if adv_frac is not None and self._adv_frac is not None:
+            # A new next-advancement starts at zero; only forward progress is
+            # rewarded, so counter resets do not create a fake negative return.
+            reward += float(self.goal_weight) * float(self.fraction_weight) * max(0.0, adv_frac - self._adv_frac)
+        if hp is not None and self._hp is not None:
+            reward -= float(self.hp_penalty) * max(0.0, self._hp - hp)
+        if adv_done is not None:
+            self._adv_done = adv_done
+        if adv_frac is not None:
+            self._adv_frac = adv_frac
+        if hp is not None:
+            self._hp = hp
+        return float(reward), completed
 
 
 def resize_rgb(frame: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -48,6 +106,17 @@ def run_minecraft_collector(
     store_w = int(cfg.capture.store_width)
     store_h = int(cfg.capture.store_height)
     mc = cfg.minecraft
+
+    # A smoke capture must never turn a convenient default such as
+    # ``runs/mc.h5`` into a destructive operation.  In particular, do not
+    # silently replace a real recording merely because ``--dry-run`` used to
+    # force ``append=False`` below.
+    target = Path(out_path)
+    if dry_run and target.exists():
+        raise RuntimeError(
+            "--dry-run refuses to modify an existing recording; choose a new --out path "
+            "(for example runs/mc_dry.h5)"
+        )
 
     if not dry_run and not desktop and region is None:
         win = pick_minecraft_window(mc.window_title)
@@ -99,15 +168,22 @@ def run_minecraft_collector(
         spec.n_slots,
         key_names=spec.key_names,
         state_fields=MC_STATE_FIELDS,
-        append=append and not dry_run,
+        append=append,
         extra_attrs={
             "fps_target": fps,
             "window_title": mc.window_title,
             "dry_run": int(dry_run),
             "fact_fields": ",".join(MC_FACT_FIELDS),
             "cursor_xy": "window-normalized cursor when GUI; OS client fallback",
+            "wheel_bins": int(spec.wheel_bins),
+            "wheel_max": float(spec.wheel_max),
+            "reward_schema": "advancement_delta + 0.35*advancement_fraction_delta - 0.2*hp_loss",
+            "episode_boundary": "F8 mark, advancement completion, timestamp gap, or recording end",
+            "look_concept": "sidecar crosshair ray, -1 when absent; training-only label",
         },
     )
+    pulse_tracker = BlockPulseTracker()
+    reward_tracker = ProgressRewardTracker()
     if writer.n > 0:
         _log(f"[collect] appending to existing {out_path} ({writer.n} frames already inside)")
     if getattr(writer, "slow_write", False):
@@ -158,6 +234,16 @@ def run_minecraft_collector(
             scope = None
             preview_backend = "unavailable"
             _log(f"[collect] capture preview failed: {exc}")
+    focus = None
+    if not dry_run and sys.platform == "win32":
+        try:
+            from atomspike.viz.overlay_win import GameFocusSession
+
+            focus = GameFocusSession(int(getattr(win, "hwnd", 0) or 0))
+            focus.begin(hide_console=False)
+            focus.nudge(park=True)
+        except Exception:
+            focus = None
     try:
         while True:
             if t_end is not None and time.perf_counter() >= t_end:
@@ -200,12 +286,15 @@ def run_minecraft_collector(
             if snap is not None:
                 mouse_xy = (float(snap.mouse_dx), float(snap.mouse_dy))
                 keys_held = np.asarray([1 if kd.get(n, False) else 0 for n in spec.key_names], dtype=np.uint8)
-            done = bool(snap.mark) if snap is not None else False
+            reward, advanced = reward_tracker.observe(raw)
+            done = (bool(snap.mark) if snap is not None else False) or advanced
+            pack = inventory_pack_from_signal(raw)
+            pulse = pulse_tracker.observe(raw)
             writer.add(
                 frame,
                 state,
                 tokens,
-                0.0,
+                reward,
                 done,
                 t_ns,
                 mouse_xy=mouse_xy,
@@ -213,12 +302,24 @@ def run_minecraft_collector(
                 facts=hub.last_facts(),
                 cursor_xy=(cx, cy),
                 wheel=float(raw.get("wheel", extra.get("wheel", 0.0))),
+                task_id=task_id_from_name(raw.get("adv_next")),
+                task_aux=np.asarray(task_aux_from_signal(raw), dtype=np.float32),
+                inv_ids=pack["inv_ids"],
+                hand_id=pack["hand_id"],
+                hover_id=pack["hover_id"],
+                carry_id=pack["carry_id"],
+                block_pulse=pulse,
+                look_concept=concept_from_signal(
+                    raw,
+                    sidecar_fresh=hub.source_name() == "sidecar" and hub.sidecar_age_s() <= 0.10,
+                ),
             )
             n += 1
             if done:
                 n_marks += 1
                 sys.stderr.write("\n")
-                _log(f"[collect] episode mark #{n_marks} at frame {n}")
+                reason = "advancement" if advanced else "manual mark"
+                _log(f"[collect] episode boundary #{n_marks} at frame {n} ({reason})")
             now = time.perf_counter()
             dt = now - tick0
             latencies.append(dt * 1000.0)
@@ -254,8 +355,10 @@ def run_minecraft_collector(
                 click = (lmb + rmb) or "-"
                 gui = "gui" if gui_open else "look"
                 hover = raw.get("hovered_slot", -1)
+                hand = raw.get("hand_item") or "-"
+                hover_item = raw.get("hover_item") or "-"
                 mouse_bit = (
-                    f"cursor={cx:.2f},{cy:.2f} hover={hover}"
+                    f"cursor={cx:.2f},{cy:.2f} hover={hover} {hover_item}"
                     if gui_open
                     else f"mouse={mouse_xy[0]:+.0f},{mouse_xy[1]:+.0f}"
                 )
@@ -265,7 +368,8 @@ def run_minecraft_collector(
                     f"{mouse_bit} click={click} {gui}  "
                     f"hp={facts[5]:.0f} hung={facts[6]:.0f}  "
                     f"xyz={facts[0]:.1f},{facts[1]:.1f},{facts[2]:.1f}  "
-                    f"look={facts[3]:.0f},{facts[4]:.0f}  src={src}",
+                    f"look={facts[3]:.0f},{facts[4]:.0f}  "
+                    f"hand={hand} adv={raw.get('adv_next') or '-'}  src={src}",
                     replace=True,
                 )
                 last_log = now
@@ -287,6 +391,11 @@ def run_minecraft_collector(
             grabber.close()
         if scope is not None:
             scope.close()
+        if focus is not None:
+            try:
+                focus.close()
+            except Exception:
+                pass
 
     elapsed = max(1e-6, time.perf_counter() - wall0)
     _log("")

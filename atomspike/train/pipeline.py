@@ -46,6 +46,12 @@ def run_pipeline(
         result["peft"] = train_peft(cfg, demo, teacher, workdir / "peft.pt", epochs=max(1, cfg.train.epochs // 2))
         teacher = result["peft"]["checkpoint"]
     if not skip_convert:
-        result["snn"] = convert_checkpoint(cfg, teacher, workdir / "snn.pt", data_path=demo)
+        result["snn"] = convert_checkpoint(
+            cfg,
+            teacher,
+            workdir / "snn.pt",
+            data_path=demo,
+            allow_lossy=True,
+        )
     env.close()
     return result

@@ -12,8 +12,11 @@ from numpy.typing import NDArray
 from atomspike.config import AtomSpikeConfig
 from atomspike.convert.pmsm import pmsm_status
 from atomspike.data.io import H5DemoDataset
+from atomspike.data.sessions import stride_split_segments
 from atomspike.envs import make_env
-from atomspike.models.agent import AtomSpikeAgent
+from atomspike.models.iterator import task_forward_kwargs
+from atomspike.models.inventory import inventory_forward_kwargs
+from atomspike.models.sea import block_pulse_forward_kwargs
 from atomspike.runtime.loop import DualRateLoop
 from atomspike.train.common import load_agent, resolve_device
 
@@ -99,27 +102,68 @@ def evaluate_offline(
     ckpt: str | Path,
     data_path: str | Path,
     max_steps: int | None = None,
+    *,
+    all_data: bool = False,
 ) -> dict:
-    """Token accuracy on recorded demos. Used when there is no scripted env (Minecraft)."""
+    """Token accuracy on held-out recordings (or explicitly all recorded demos)."""
     device = resolve_device(cfg.train.device)
     agent = load_agent(ckpt, cfg, device)
     agent.eval()
     ds = H5DemoDataset.from_config(data_path, cfg)
     ds.assert_matches(cfg)
-    n = len(ds) if max_steps is None else min(len(ds), int(max_steps))
+    all_idx = np.arange(len(ds), dtype=np.int64)
+    if all_data:
+        indices = all_idx
+        split = "all"
+    else:
+        _train, indices = stride_split_segments(
+            len(ds), cfg.train.val_frac, getattr(ds, "recording_id", None)
+        )
+        split = "heldout_recordings"
+        if indices.size == 0:
+            raise ValueError(
+                "offline evaluation requires at least two recording sessions for a held-out split; "
+                "record another session or pass --all-data to explicitly evaluate on every demo"
+            )
+    if max_steps is not None:
+        indices = indices[: max(0, int(max_steps))]
+    n = int(indices.size)
+    if n == 0:
+        raise ValueError("offline evaluation received no samples")
     batch_size = max(1, int(cfg.train.batch_size))
     pred_all: list[np.ndarray] = []
     tgt_all: list[np.ndarray] = []
     gui_all: list[np.ndarray] = []
     t0 = time.perf_counter()
     for start in range(0, n, batch_size):
-        sl = range(start, min(start + batch_size, n))
+        sl = indices[start : min(start + batch_size, n)].tolist()
+        # Offline rows are not a recurrent rollout.  Reset all persistent
+        # state before each independently assembled batch.
+        agent.reset_runtime()
         frames = torch.stack([torch.from_numpy(ds[j]["frame"]) for j in sl]).to(device)
         prev = torch.stack([torch.from_numpy(ds[j]["prev_frame"]) for j in sl]).to(device)
         state = torch.stack([torch.from_numpy(ds[j]["game_state"]) for j in sl]).to(device)
         tgt = torch.stack([torch.from_numpy(ds[j]["action"]) for j in sl]).to(device)
         clock = torch.stack([torch.from_numpy(ds[j]["clock"]) for j in sl]).to(device)
-        out = agent(frames, state, prev_frames=prev, reason_tick=True, clock=clock)
+        task_batch = {
+            "task_id": torch.from_numpy(np.concatenate([ds[j]["task_id"] for j in sl])),
+            "task_aux": torch.from_numpy(np.stack([np.asarray(ds[j]["task_aux"], dtype=np.float32) for j in sl])),
+            "inv_ids": torch.from_numpy(np.stack([np.asarray(ds[j]["inv_ids"], dtype=np.int64) for j in sl])),
+            "hand_id": torch.from_numpy(np.concatenate([ds[j]["hand_id"] for j in sl])),
+            "hover_id": torch.from_numpy(np.concatenate([ds[j]["hover_id"] for j in sl])),
+            "carry_id": torch.from_numpy(np.concatenate([ds[j]["carry_id"] for j in sl])),
+            "block_pulse": torch.from_numpy(np.stack([np.asarray(ds[j]["block_pulse"], dtype=np.float32) for j in sl])),
+        }
+        out = agent(
+            frames,
+            state,
+            prev_frames=prev,
+            reason_tick=True,
+            clock=clock,
+            **task_forward_kwargs(task_batch, device),
+            **inventory_forward_kwargs(task_batch, device),
+            **block_pulse_forward_kwargs(task_batch, device),
+        )
         pred = torch.stack([lg.argmax(dim=-1) for lg in out["logits"]], dim=1)
         pred_all.append(pred.cpu().numpy())
         tgt_all.append(tgt.cpu().numpy())
@@ -129,7 +173,7 @@ def evaluate_offline(
     tgt = np.concatenate(tgt_all)
     eq = pred == tgt
     slot_acc = eq.mean(axis=0).tolist()
-    names = list(agent.spec.key_names) + ["mouse_x", "mouse_y"] + ["LMB", "RMB"][: agent.spec.n_mouse_buttons]
+    names = list(agent.spec.slot_names)
     slot_named = {names[i] if i < len(names) else f"slot{i}": float(slot_acc[i]) for i in range(len(slot_acc))}
     mx_i = agent.spec.n_keys
     center = int(agent.spec.mouse_center)
@@ -168,6 +212,9 @@ def evaluate_offline(
         "params": agent.parameter_count(),
         "mouse_bins": int(agent.spec.mouse_bins),
         "data": str(data_path),
+        "split": split,
+        "n_sessions": int(getattr(ds, "n_sessions", 1) or 1),
+        "n_recordings": int(getattr(ds, "n_recordings", 1) or 1),
     }
 
 

@@ -2,18 +2,19 @@
 
 pygame/SDL ShowWindow + flip() steal focus from Minecraft. This path creates a
 WS_EX_NOACTIVATE | WS_EX_TOPMOST tool window and blits RGB with GDI.
+
+Do not spawn a child process for the overlay: starting pythonw from a console
+app pulls cmd / Windows Terminal back to the foreground.
 """
 
 from __future__ import annotations
 
 import ctypes
-import multiprocessing as mp
 import os
 import sys
 import threading
 import time
 from ctypes import wintypes
-from pathlib import Path
 
 import numpy as np
 
@@ -35,25 +36,46 @@ WM_QUIT = 0x0012
 WM_ERASEBKGND = 0x0014
 WM_ACTIVATE = 0x0006
 WM_PAINT = 0x000F
+WM_SETFOCUS = 0x0007
 WM_MOUSEACTIVATE = 0x0021
 WM_NCACTIVATE = 0x0086
 WM_LBUTTONDOWN = 0x0201
 MA_NOACTIVATE = 3
 PM_REMOVE = 1
+SW_HIDE = 0
 SW_SHOWNOACTIVATE = 4
+SW_SHOW = 5
+SW_SHOWMINNOACTIVE = 7
+SW_FORCEMINIMIZE = 11
 SW_RESTORE = 9
+SW_SHOWNA = 8
+ATTACH_PARENT_PROCESS = 0xFFFFFFFF
 GA_ROOT = 2
+GA_ROOTOWNER = 3
+HWND_NOTOPMOST = -2
+SWP_NOZORDER = 0x0004
+VK_MENU = 0x12
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+ASFW_ANY = 0xFFFFFFFF
+SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
+SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
+TH32CS_SNAPPROCESS = 0x00000002
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 INPUT_MOUSE = 0
 MOUSEEVENTF_MOVE = 0x0001
 SRCCOPY = 0x00CC0020
 DIB_RGB_COLORS = 0
 BI_RGB = 0
 HWND_TOPMOST = -1
+HWND_TOP = 0
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
 SWP_SHOWWINDOW = 0x0040
 
+WS_CHILD = 0x40000000
 WS_POPUP = 0x80000000
 WS_CAPTION = 0x00C00000
 WS_SYSMENU = 0x00080000
@@ -61,8 +83,17 @@ WS_CLIPCHILDREN = 0x02000000
 WS_CLIPSIBLINGS = 0x04000000
 
 WS_EX_TOPMOST = 0x00000008
+WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_LAYERED = 0x00080000
 WS_EX_NOACTIVATE = 0x08000000
+GWL_STYLE = -16
+GWL_EXSTYLE = -20
+LWA_COLORKEY = 0x00000001
+ULW_ALPHA = 0x00000002
+AC_SRC_OVER = 0x00
+AC_SRC_ALPHA = 0x01
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
 CS_HREDRAW = 0x0002
 CS_VREDRAW = 0x0001
@@ -85,6 +116,17 @@ class WNDCLASSW(ctypes.Structure):
         ("hbrBackground", HANDLE_PTR),
         ("lpszMenuName", wintypes.LPCWSTR),
         ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.UINT),
+        ("flags", wintypes.UINT),
+        ("showCmd", wintypes.UINT),
+        ("ptMinPosition", wintypes.POINT),
+        ("ptMaxPosition", wintypes.POINT),
+        ("rcNormalPosition", wintypes.RECT),
     ]
 
 
@@ -129,6 +171,18 @@ user32.DestroyWindow.argtypes = [HANDLE_PTR]
 user32.DestroyWindow.restype = wintypes.BOOL
 user32.ShowWindow.argtypes = [HANDLE_PTR, ctypes.c_int]
 user32.ShowWindow.restype = wintypes.BOOL
+user32.IsWindowVisible.argtypes = [HANDLE_PTR]
+user32.IsWindowVisible.restype = wintypes.BOOL
+user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
+kernel32.FreeConsole.argtypes = []
+kernel32.FreeConsole.restype = wintypes.BOOL
+kernel32.AttachConsole.argtypes = [wintypes.DWORD]
+kernel32.AttachConsole.restype = wintypes.BOOL
+user32.GetWindowPlacement.argtypes = [HANDLE_PTR, ctypes.c_void_p]
+user32.GetWindowPlacement.restype = wintypes.BOOL
+user32.SetWindowPlacement.argtypes = [HANDLE_PTR, ctypes.c_void_p]
+user32.SetWindowPlacement.restype = wintypes.BOOL
 user32.SetWindowPos.argtypes = [
     HANDLE_PTR,
     HANDLE_PTR,
@@ -185,6 +239,20 @@ user32.BringWindowToTop.argtypes = [HANDLE_PTR]
 user32.BringWindowToTop.restype = wintypes.BOOL
 user32.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
 user32.SendInput.restype = wintypes.UINT
+user32.GetClassNameW.argtypes = [HANDLE_PTR, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+user32.SetActiveWindow.argtypes = [HANDLE_PTR]
+user32.SetActiveWindow.restype = HANDLE_PTR
+user32.SwitchToThisWindow.argtypes = [HANDLE_PTR, wintypes.BOOL]
+user32.SwitchToThisWindow.restype = None
+user32.keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, wintypes.DWORD, ctypes.c_size_t]
+user32.keybd_event.restype = None
+user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
+user32.SystemParametersInfoW.restype = wintypes.BOOL
+kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+kernel32.CreateToolhelp32Snapshot.restype = HANDLE_PTR
+kernel32.CloseHandle.argtypes = [HANDLE_PTR]
+kernel32.CloseHandle.restype = wintypes.BOOL
 gdi32.StretchDIBits.argtypes = [
     wintypes.HDC,
     ctypes.c_int,
@@ -201,6 +269,27 @@ gdi32.StretchDIBits.argtypes = [
     wintypes.DWORD,
 ]
 gdi32.StretchDIBits.restype = ctypes.c_int
+user32.SetLayeredWindowAttributes.argtypes = [HANDLE_PTR, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD]
+user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
+user32.SetParent.argtypes = [HANDLE_PTR, HANDLE_PTR]
+user32.SetParent.restype = HANDLE_PTR
+user32.GetParent.argtypes = [HANDLE_PTR]
+user32.GetParent.restype = HANDLE_PTR
+user32.SetWindowDisplayAffinity.argtypes = [HANDLE_PTR, wintypes.DWORD]
+user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+
+
+class SIZE(ctypes.Structure):
+    _fields_ = [("cx", wintypes.LONG), ("cy", wintypes.LONG)]
+
+
+class BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [
+        ("BlendOp", wintypes.BYTE),
+        ("BlendFlags", wintypes.BYTE),
+        ("SourceConstantAlpha", wintypes.BYTE),
+        ("AlphaFormat", wintypes.BYTE),
+    ]
 
 
 class BITMAPINFOHEADER(ctypes.Structure):
@@ -221,6 +310,60 @@ class BITMAPINFOHEADER(ctypes.Structure):
 
 class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 1)]
+
+
+user32.GetWindowRect.argtypes = [HANDLE_PTR, ctypes.POINTER(wintypes.RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
+user32.UpdateLayeredWindow.argtypes = [
+    HANDLE_PTR,
+    wintypes.HDC,
+    ctypes.POINTER(wintypes.POINT),
+    ctypes.POINTER(SIZE),
+    wintypes.HDC,
+    ctypes.POINTER(wintypes.POINT),
+    wintypes.DWORD,
+    ctypes.POINTER(BLENDFUNCTION),
+    wintypes.DWORD,
+]
+user32.UpdateLayeredWindow.restype = wintypes.BOOL
+gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+gdi32.CreateCompatibleDC.restype = wintypes.HDC
+gdi32.CreateDIBSection.argtypes = [
+    wintypes.HDC,
+    ctypes.c_void_p,
+    wintypes.UINT,
+    ctypes.POINTER(ctypes.c_void_p),
+    HANDLE_PTR,
+    wintypes.DWORD,
+]
+gdi32.CreateDIBSection.restype = HANDLE_PTR
+gdi32.SelectObject.argtypes = [HANDLE_PTR, HANDLE_PTR]
+gdi32.SelectObject.restype = HANDLE_PTR
+gdi32.DeleteObject.argtypes = [HANDLE_PTR]
+gdi32.DeleteObject.restype = wintypes.BOOL
+gdi32.DeleteDC.argtypes = [wintypes.HDC]
+gdi32.DeleteDC.restype = wintypes.BOOL
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
+kernel32.Process32FirstW.argtypes = [HANDLE_PTR, ctypes.POINTER(PROCESSENTRY32W)]
+kernel32.Process32FirstW.restype = wintypes.BOOL
+kernel32.Process32NextW.argtypes = [HANDLE_PTR, ctypes.POINTER(PROCESSENTRY32W)]
+kernel32.Process32NextW.restype = wintypes.BOOL
 
 
 class PAINTSTRUCT(ctypes.Structure):
@@ -266,12 +409,71 @@ def _pid_of(hwnd) -> int:
     return int(dummy.value)
 
 
+_SHELL_EXES = {
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "conhost.exe",
+    "windowsterminal.exe",
+    "openconsole.exe",
+    "windowsterminalpreview.exe",
+}
+_SHELL_CLASSES = {
+    "ConsoleWindowClass",
+    "CASCADIA_HOSTING_WINDOW_CLASS",
+    "CASCADIA_MAIN_WINDOW",
+    "PseudoConsoleWindow",
+    "WinUIDesktopWin32WindowClass",
+}
+
+
+def _class_name(hwnd) -> str:
+    hwnd = _hwnd_int(hwnd)
+    if not hwnd:
+        return ""
+    buf = ctypes.create_unicode_buffer(256)
+    n = int(user32.GetClassNameW(HANDLE_PTR(hwnd), buf, 256) or 0)
+    return str(buf.value) if n else ""
+
+
+def _process_rows() -> list[tuple[int, int, str]]:
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or _hwnd_int(snap) == (INVALID_HANDLE_VALUE or 0):
+        return []
+    rows: list[tuple[int, int, str]] = []
+    try:
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if not kernel32.Process32FirstW(snap, ctypes.byref(pe)):
+            return []
+        while True:
+            rows.append((int(pe.th32ProcessID), int(pe.th32ParentProcessID), str(pe.szExeFile).lower()))
+            if not kernel32.Process32NextW(snap, ctypes.byref(pe)):
+                break
+    finally:
+        kernel32.CloseHandle(snap)
+    return rows
+
+
 def _shell_pids() -> set[int]:
+    """Pids that belong to *this* console tree, not the whole desktop (e.g. Cursor)."""
     pids = {int(os.getpid())}
     try:
-        pids.add(int(os.getppid()))
+        rows = _process_rows()
     except Exception:
-        pass
+        rows = []
+    by_pid = {pid: (parent, exe) for pid, parent, exe in rows}
+    try:
+        cur = int(os.getppid())
+    except Exception:
+        cur = 0
+    while cur and cur not in pids:
+        parent, exe = by_pid.get(cur, (0, ""))
+        name = exe.rsplit("\\", 1)[-1]
+        if name not in _SHELL_EXES:
+            break
+        pids.add(cur)
+        cur = int(parent or 0)
     try:
         con = _hwnd_int(kernel32.GetConsoleWindow())
         if con:
@@ -281,47 +483,139 @@ def _shell_pids() -> set[int]:
                 pids.add(_pid_of(root))
     except Exception:
         pass
-        return {p for p in pids if p}
+    return {p for p in pids if p}
+
+
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, HANDLE_PTR, wintypes.LPARAM)
+
+
+def _minimize_hwnd(hwnd: int) -> None:
+    hwnd = _hwnd_int(hwnd)
+    if not hwnd:
+        return
+    try:
+        user32.ShowWindow(HANDLE_PTR(hwnd), SW_SHOWMINNOACTIVE)
+        if not user32.IsIconic(HANDLE_PTR(hwnd)):
+            user32.ShowWindow(HANDLE_PTR(hwnd), SW_FORCEMINIMIZE)
+    except Exception:
+        return
+
+
+def _windows_for_pids(pids: set[int]) -> list[int]:
+    hits: list[int] = []
+    if not pids:
+        return hits
+
+    @WNDENUMPROC
+    def _cb(hwnd, _lp):  # type: ignore[misc]
+        h = _hwnd_int(hwnd)
+        if h and user32.IsWindowVisible(HANDLE_PTR(h)) and _pid_of(h) in pids:
+            hits.append(h)
+        return True
+
+    try:
+        user32.EnumWindows(_cb, 0)
+    except Exception:
+        return hits
+    return hits
+
+
+def _visible_shell_hwnd() -> int:
+    """The window the user actually sees (Windows Terminal host, not a nested conhost)."""
+    con = _hwnd_int(kernel32.GetConsoleWindow())
+    chain: list[int] = []
+    if con:
+        chain.append(con)
+        for flag in (GA_ROOTOWNER, GA_ROOT):
+            h = _hwnd_int(user32.GetAncestor(HANDLE_PTR(con), flag))
+            if h and h not in chain:
+                chain.append(h)
+    pids = _shell_pids()
+    for h in chain:
+        pid = _pid_of(h)
+        if pid:
+            pids.add(pid)
+    ranked: list[tuple[str, int]] = []
+    seen: set[int] = set()
+    for h in chain + _windows_for_pids(pids):
+        if not h or h in seen:
+            continue
+        seen.add(h)
+        ranked.append((_class_name(h), h))
+    prefer = (
+        "CASCADIA_HOSTING_WINDOW_CLASS",
+        "CASCADIA_MAIN_WINDOW",
+        "WinUIDesktopWin32WindowClass",
+        "ConsoleWindowClass",
+        "PseudoConsoleWindow",
+    )
+    for want in prefer:
+        for cls, h in ranked:
+            if cls == want:
+                return h
+    for cls, h in ranked:
+        if cls in _SHELL_CLASSES:
+            return h
+    return chain[0] if chain else 0
+
+
+def _minimize_shell_windows(pids: set[int], extra: list[int], *, game_hwnd: int = 0) -> None:
+    our = int(os.getpid())
+    seen: set[int] = set()
+    for h in list(extra) + _windows_for_pids(pids):
+        h = _hwnd_int(h)
+        if not h or h in seen:
+            continue
+        seen.add(h)
+        if _pid_of(h) == our:
+            continue
+        if game_hwnd and _hwnds_related(h, game_hwnd):
+            continue
+        if _class_name(h) in _SHELL_CLASSES or _pid_of(h) in pids:
+            _minimize_hwnd(h)
 
 
 def detach_console_keep_stdio() -> bool:
-    """Detach this process from cmd so later windows cannot pull the console forward."""
+    """Detach from cmd/Windows Terminal so CreateWindow cannot pull that console forward."""
     try:
         sys.stdout.flush()
         sys.stderr.flush()
     except Exception:
         pass
-    out_fd = err_fd = None
     try:
-        out_fd = os.dup(1)
-        err_fd = os.dup(2)
-    except OSError:
-        pass
-    try:
-        ok = bool(kernel32.FreeConsole())
+        return bool(kernel32.FreeConsole())
     except Exception:
-        ok = False
-    if out_fd is not None:
-        try:
-            sys.stdout = open(out_fd, "w", encoding="utf-8", errors="replace", closefd=True, buffering=1)
-            sys.stderr = open(err_fd, "w", encoding="utf-8", errors="replace", closefd=True, buffering=1)
-        except Exception:
-            pass
-    return ok
+        return False
 
 
-def _pythonw_executable() -> str:
-    cand = Path(sys.executable).with_name("pythonw.exe")
-    if cand.is_file():
-        return str(cand)
-    return sys.executable
+_CTRL_HANDLER_REF = None
 
 
-def foreground_is_shell() -> bool:
+def ignore_console_ctrl_c() -> None:
+    """Sprint is CTRL. A console-attached Python dies on CTRL+C without this."""
+    global _CTRL_HANDLER_REF
+    try:
+        Handler = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+        def _handled(_etype):
+            return True
+
+        if _CTRL_HANDLER_REF is None:
+            _CTRL_HANDLER_REF = Handler(_handled)
+        kernel32.SetConsoleCtrlHandler(_CTRL_HANDLER_REF, True)
+        kernel32.SetConsoleCtrlHandler(None, True)
+    except Exception:
+        pass
+
+
+def foreground_is_shell(thief_pids: set[int] | None = None) -> bool:
     fg = _hwnd_int(user32.GetForegroundWindow())
     if not fg:
         return False
-    return _pid_of(fg) in _shell_pids()
+    if _class_name(fg) in _SHELL_CLASSES:
+        return True
+    pids = thief_pids if thief_pids is not None else _shell_pids()
+    return _pid_of(fg) in pids
 
 
 def _nudge_foreground_lock() -> None:
@@ -360,20 +654,41 @@ def _park_cursor_in_game(hwnd: int) -> None:
     user32.SetCursorPos(int(pt.x), int(pt.y))
 
 
-def restore_game_focus(hwnd, *, park_cursor: bool = False) -> None:
+def _hwnds_related(a, b) -> bool:
+    try:
+        from atomspike.capture.window import hwnds_related
+
+        return bool(hwnds_related(_hwnd_int(a), _hwnd_int(b)))
+    except Exception:
+        a, b = _hwnd_int(a), _hwnd_int(b)
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        ra = _hwnd_int(user32.GetAncestor(HANDLE_PTR(a), GA_ROOTOWNER)) or _hwnd_int(
+            user32.GetAncestor(HANDLE_PTR(a), GA_ROOT)
+        )
+        rb = _hwnd_int(user32.GetAncestor(HANDLE_PTR(b), GA_ROOTOWNER)) or _hwnd_int(
+            user32.GetAncestor(HANDLE_PTR(b), GA_ROOT)
+        )
+        return bool(ra and rb and ra == rb)
+
+
+def restore_game_focus(hwnd, *, park_cursor: bool = False, allow_alt: bool = True) -> bool:
     """Pull foreground (and optionally the cursor) back from cmd/Windows Terminal."""
     hwnd = _hwnd_int(hwnd)
     if not hwnd:
-        return
+        return False
     try:
         if not user32.IsWindow(HANDLE_PTR(hwnd)):
-            return
+            return False
         fg = _hwnd_int(user32.GetForegroundWindow())
-        already = fg == hwnd
-        if already and not park_cursor:
-            return
+        if _hwnds_related(fg, hwnd):
+            if park_cursor:
+                _park_cursor_in_game(hwnd)
+            return True
         try:
-            user32.AllowSetForegroundWindow(0xFFFFFFFF)
+            user32.AllowSetForegroundWindow(ASFW_ANY)
         except Exception:
             pass
         _nudge_foreground_lock()
@@ -387,18 +702,299 @@ def restore_game_focus(hwnd, *, park_cursor: bool = False) -> None:
             attached_fg = bool(user32.AttachThreadInput(our, fg_tid, True))
         if game_tid and game_tid != our and game_tid != fg_tid:
             attached_game = bool(user32.AttachThreadInput(our, game_tid, True))
-        if user32.IsIconic(HANDLE_PTR(hwnd)):
-            user32.ShowWindow(HANDLE_PTR(hwnd), SW_RESTORE)
-        user32.BringWindowToTop(HANDLE_PTR(hwnd))
-        user32.SetForegroundWindow(HANDLE_PTR(hwnd))
-        if attached_game:
-            user32.AttachThreadInput(our, game_tid, False)
-        if attached_fg:
-            user32.AttachThreadInput(our, fg_tid, False)
+        try:
+            if user32.IsIconic(HANDLE_PTR(hwnd)):
+                user32.ShowWindow(HANDLE_PTR(hwnd), SW_RESTORE)
+            user32.SetForegroundWindow(HANDLE_PTR(hwnd))
+            try:
+                user32.SetActiveWindow(HANDLE_PTR(hwnd))
+            except Exception:
+                pass
+            if allow_alt and not _hwnds_related(_hwnd_int(user32.GetForegroundWindow()), hwnd):
+                user32.keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY, 0)
+                try:
+                    user32.SetForegroundWindow(HANDLE_PTR(hwnd))
+                    user32.SwitchToThisWindow(HANDLE_PTR(hwnd), True)
+                finally:
+                    user32.keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+        finally:
+            if attached_game:
+                user32.AttachThreadInput(our, game_tid, False)
+            if attached_fg:
+                user32.AttachThreadInput(our, fg_tid, False)
         if park_cursor:
             _park_cursor_in_game(hwnd)
+        return _hwnds_related(_hwnd_int(user32.GetForegroundWindow()), hwnd)
     except Exception:
+        return False
+
+
+def reveal_window_inactive(hwnd: int) -> None:
+    """Un-minimize a window without making it the foreground (cmd must not steal MC)."""
+    hwnd = _hwnd_int(hwnd)
+    if not hwnd:
         return
+    try:
+        wp = WINDOWPLACEMENT()
+        wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+        if user32.GetWindowPlacement(HANDLE_PTR(hwnd), ctypes.byref(wp)):
+            wp.flags = 0
+            wp.showCmd = SW_SHOWNOACTIVATE
+            user32.SetWindowPlacement(HANDLE_PTR(hwnd), ctypes.byref(wp))
+        else:
+            user32.ShowWindow(HANDLE_PTR(hwnd), SW_SHOWNOACTIVATE)
+        user32.SetWindowPos(
+            HANDLE_PTR(hwnd),
+            HANDLE_PTR(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+        )
+    except Exception:
+        try:
+            user32.ShowWindow(HANDLE_PTR(hwnd), SW_SHOWNOACTIVATE)
+        except Exception:
+            pass
+
+
+def handoff_game_focus(hwnd: int) -> None:
+    """After python exits, cmd often takes focus. A detached helper gives it back."""
+    hwnd = _hwnd_int(hwnd)
+    if not hwnd:
+        return
+    try:
+        import subprocess
+
+        create_no_window = 0x08000000
+        detached = 0x00000008
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys,time,ctypes; time.sleep(0.4); ctypes.windll.user32.SetForegroundWindow(int(sys.argv[1]))",
+                str(hwnd),
+            ],
+            creationflags=detached | create_no_window,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        try:
+            user32.AllowSetForegroundWindow(int(proc.pid))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+class GameFocusSession:
+    """Hide cmd, detach the console, and yank focus back whenever the shell steals it.
+
+    Does not steal from other apps (browser, Cursor, etc.) — only our console tree
+    and this process's overlay. Console prints during the session go to `log_path`
+    so Windows Terminal is not woken by `[learn]` / `[predict]` lines.
+    """
+
+    def __init__(self, game_hwnd: int = 0, log_path: str | os.PathLike | None = None):
+        self.game_hwnd = int(game_hwnd or 0)
+        self._console_hwnd = _visible_shell_hwnd() or _hwnd_int(kernel32.GetConsoleWindow())
+        self._thief_pids = _shell_pids()
+        host_pid = _pid_of(self._console_hwnd)
+        if host_pid:
+            self._thief_pids.add(host_pid)
+        self._hidden = False
+        self._detached = False
+        self._lock_timeout = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._parked = False
+        self._log_path = os.fspath(log_path) if log_path else None
+        self._old_out = None
+        self._old_err = None
+        self._log_f = None
+        self._saved_out_fd = None
+        self._saved_err_fd = None
+
+    def is_thief(self, hwnd: int | None = None) -> bool:
+        hwnd = _hwnd_int(hwnd if hwnd is not None else user32.GetForegroundWindow())
+        if not hwnd:
+            return False
+        if _hwnds_related(hwnd, self.game_hwnd):
+            return False
+        if _pid_of(hwnd) == int(os.getpid()):
+            return True
+        if _pid_of(hwnd) in self._thief_pids:
+            return True
+        if self._console_hwnd and hwnd == self._console_hwnd:
+            return True
+        return _class_name(hwnd) in _SHELL_CLASSES
+
+    def nudge(self, *, park: bool = False) -> bool:
+        if not self.game_hwnd:
+            return False
+        fg = _hwnd_int(user32.GetForegroundWindow())
+        if _hwnds_related(fg, self.game_hwnd):
+            if park and not self._parked:
+                _park_cursor_in_game(self.game_hwnd)
+                self._parked = True
+            return True
+        if not self.is_thief(fg) and fg:
+            return False
+        ok = restore_game_focus(self.game_hwnd, park_cursor=bool(park and not self._parked), allow_alt=False)
+        if park:
+            self._parked = True
+        return ok
+
+    def _silence_console(self) -> None:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            self._saved_out_fd = os.dup(1)
+            self._saved_err_fd = os.dup(2)
+        except OSError:
+            self._saved_out_fd = self._saved_err_fd = None
+        if self._log_path:
+            try:
+                parent = os.path.dirname(self._log_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                self._old_out, self._old_err = sys.stdout, sys.stderr
+                self._log_f = open(self._log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+                sys.stdout = self._log_f
+                sys.stderr = self._log_f
+                try:
+                    os.dup2(self._log_f.fileno(), 1)
+                    os.dup2(self._log_f.fileno(), 2)
+                except OSError:
+                    pass
+            except Exception:
+                self._log_f = None
+        self._detached = detach_console_keep_stdio()
+
+    def _restore_stdio(self) -> None:
+        if self._detached:
+            try:
+                kernel32.AttachConsole(ATTACH_PARENT_PROCESS)
+            except Exception:
+                pass
+            self._detached = False
+        if self._saved_out_fd is not None:
+            try:
+                os.dup2(self._saved_out_fd, 1)
+                os.close(self._saved_out_fd)
+            except OSError:
+                pass
+            self._saved_out_fd = None
+        if self._saved_err_fd is not None:
+            try:
+                os.dup2(self._saved_err_fd, 2)
+                os.close(self._saved_err_fd)
+            except OSError:
+                pass
+            self._saved_err_fd = None
+        if self._old_out is not None:
+            sys.stdout = self._old_out
+            self._old_out = None
+        if self._old_err is not None:
+            sys.stderr = self._old_err
+            self._old_err = None
+        if self._log_f is not None:
+            try:
+                self._log_f.flush()
+                self._log_f.close()
+            except Exception:
+                pass
+            self._log_f = None
+
+    def begin(self, *, hide_console: bool = True, park: bool = False) -> None:
+        if hide_console:
+            _minimize_shell_windows(self._thief_pids, [self._console_hwnd], game_hwnd=self.game_hwnd)
+            self._hidden = bool(self._console_hwnd)
+            self._silence_console()
+        ignore_console_ctrl_c()
+        try:
+            user32.AllowSetForegroundWindow(ASFW_ANY)
+        except Exception:
+            pass
+        timeout = wintypes.UINT(0)
+        try:
+            if user32.SystemParametersInfoW(
+                SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ctypes.byref(timeout), 0
+            ):
+                self._lock_timeout = int(timeout.value)
+                user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, ctypes.c_void_p(0), 0)
+        except Exception:
+            self._lock_timeout = None
+        self.nudge(park=park)
+        if self._thread is None or not self._thread.is_alive():
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._loop, name="atomspike-focus", daemon=True)
+            self._thread.start()
+
+    def _confine_cursor(self) -> None:
+        if not self.game_hwnd:
+            return
+        try:
+            from atomspike.capture.window import clip_cursor_to_hwnd
+
+            clip_cursor_to_hwnd(self.game_hwnd)
+        except Exception:
+            pass
+
+    def _release_cursor(self) -> None:
+        try:
+            from atomspike.capture.window import unclip_cursor
+
+            unclip_cursor()
+        except Exception:
+            pass
+
+    def _loop(self) -> None:
+        while not self._stop.wait(0.05):
+            try:
+                fg = _hwnd_int(user32.GetForegroundWindow())
+                if _hwnds_related(fg, self.game_hwnd):
+                    continue
+                if self.is_thief(fg) or not fg:
+                    self.nudge(park=False)
+                    continue
+                self._release_cursor()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        self._stop.set()
+        self._release_cursor()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=0.6)
+        self._thread = None
+        if self._lock_timeout is not None:
+            try:
+                user32.SystemParametersInfoW(
+                    SPI_SETFOREGROUNDLOCKTIMEOUT,
+                    0,
+                    ctypes.c_void_p(self._lock_timeout),
+                    0,
+                )
+            except Exception:
+                pass
+            self._lock_timeout = None
+        self._restore_stdio()
+        if self._hidden and self._console_hwnd:
+            try:
+                if user32.IsWindow(HANDLE_PTR(self._console_hwnd)):
+                    reveal_window_inactive(self._console_hwnd)
+            except Exception:
+                pass
+            self._hidden = False
+        if self.game_hwnd:
+            restore_game_focus(self.game_hwnd, park_cursor=False, allow_alt=False)
 
 
 class Win32Overlay:
@@ -414,14 +1010,23 @@ class Win32Overlay:
         y: int,
         hz: float,
         game_hwnd: int = 0,
+        layered: bool = False,
+        click_through: bool = False,
+        chroma_rgb: tuple[int, int, int] | None = None,
+        follow: bool = False,
     ):
         self.title = str(title)
         self.width = max(8, int(width))
         self.height = max(8, int(height))
         self.x = x
         self.y = int(y)
-        self.hz = max(10.0, float(hz))
+        self.hz = max(8.0, float(hz))
         self.game_hwnd = int(game_hwnd or 0)
+        self.layered = bool(layered or chroma_rgb is not None or follow)
+        self.click_through = bool(click_through)
+        self.chroma_rgb = None if chroma_rgb is None else (int(chroma_rgb[0]), int(chroma_rgb[1]), int(chroma_rgb[2]))
+        self.follow = bool(follow)
+        self._embedded = False
         self.alive = False
         self._ok = False
         self._hwnd = 0
@@ -430,6 +1035,14 @@ class Win32Overlay:
         self._composer = None
         self._bgra: np.ndarray | None = None
         self._last: np.ndarray | None = None
+        self._last_pos: tuple[int, int, int, int] | None = None
+        self._last_z = 0.0
+        self._visible = True
+        self._hdc_mem = None
+        self._hbm = None
+        self._hbm_old = None
+        self._dib_bits = None
+        self._dib_wh = (0, 0)
         self._wndproc = WNDPROCTYPE(self._wnd_proc)
         self._wc = None
         self._class_name = f"AtomSpikeOverlay{id(self)}"
@@ -441,11 +1054,7 @@ class Win32Overlay:
         self._thread.start()
         self._ready.wait(2.5)
         if self._ok:
-            for i in range(15):
-                restore_game_focus(self.game_hwnd, park_cursor=(i == 0))
-                if _hwnd_int(user32.GetForegroundWindow()) == int(self.game_hwnd):
-                    break
-                time.sleep(0.04)
+            restore_game_focus(self.game_hwnd, park_cursor=False, allow_alt=False)
             return True
         self.close()
         return False
@@ -462,13 +1071,30 @@ class Win32Overlay:
             self._thread.join(timeout=1.0)
         self._thread = None
         self._hwnd = 0
+        self._release_dib()
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
         try:
             msg = int(msg)
             if msg == WM_MOUSEACTIVATE:
                 return MA_NOACTIVATE
+            if msg == WM_ACTIVATE:
+                if (int(_u64(wparam)) & 0xFFFF) != 0 and self.game_hwnd:
+                    try:
+                        user32.SetForegroundWindow(HANDLE_PTR(self.game_hwnd))
+                    except Exception:
+                        pass
+                return 0
+            if msg == WM_SETFOCUS:
+                if self.game_hwnd:
+                    try:
+                        user32.SetForegroundWindow(HANDLE_PTR(self.game_hwnd))
+                    except Exception:
+                        pass
+                return 0
             if msg == WM_LBUTTONDOWN:
+                if self.click_through:
+                    return 0
                 x = int(_u64(lparam) & 0xFFFF)
                 y = int((_u64(lparam) >> 16) & 0xFFFF)
                 if x >= max(8, self.width - 40) and y <= 40:
@@ -477,8 +1103,6 @@ class Win32Overlay:
                     return 0
             if msg == WM_NCACTIVATE:
                 return user32.DefWindowProcW(hwnd, msg, 0, _signed_ptr(lparam))
-            if msg == WM_ACTIVATE:
-                return 0
             if msg == WM_ERASEBKGND:
                 return 1
             if msg == WM_PAINT:
@@ -510,16 +1134,27 @@ class Win32Overlay:
         wc.lpszClassName = self._class_name
         self._wc = wc
         user32.RegisterClassW(ctypes.byref(wc))
+        if self.follow and self.game_hwnd:
+            hwnd = self._create_owned_follow(inst)
+            if hwnd:
+                return hwnd
+            print("[overlay] could not attach HUD to the Minecraft window", flush=True)
+            return 0
         style = WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS
         ex = WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+        if self.layered:
+            ex |= WS_EX_LAYERED
+        if self.click_through:
+            ex |= WS_EX_TRANSPARENT
         outer_w = int(self.width)
         outer_h = int(self.height)
         if self.x is None:
             screen_w = int(user32.GetSystemMetrics(SM_CXSCREEN) or 1280)
             pos_x = max(16, screen_w - outer_w - 24)
+            pos_y = int(self.y)
         else:
             pos_x = int(self.x)
-        pos_y = int(self.y)
+            pos_y = int(self.y)
         hwnd_p = user32.CreateWindowExW(
             ex,
             self._class_name,
@@ -539,6 +1174,7 @@ class Win32Overlay:
             err = int(ctypes.GetLastError() or 0)
             print(f"[overlay] CreateWindowExW failed winerr={err}", flush=True)
             return 0
+        self._decorate(hwnd)
         user32.SetWindowPos(
             HANDLE_PTR(hwnd),
             HANDLE_PTR(HWND_TOPMOST),
@@ -546,23 +1182,188 @@ class Win32Overlay:
             pos_y,
             outer_w,
             outer_h,
-            SWP_NOACTIVATE,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
         )
-        user32.ShowWindow(HANDLE_PTR(hwnd), SW_SHOWNOACTIVATE)
+        user32.ShowWindow(HANDLE_PTR(hwnd), SW_SHOWNA)
         return hwnd
 
-    def _to_bgra(self, rgb: np.ndarray) -> np.ndarray:
+    def _create_owned_follow(self, inst) -> int:
+        """Layered popup owned by Minecraft, locked to the client rect.
+
+        A WS_CHILD of the GLFW/OpenGL window is painted over every swap, so
+        the HUD must be a sibling overlay in screen space, not a child.
+        """
+        game = self.game_hwnd
+        screen = self._game_client_screen(game)
+        if screen is None:
+            return 0
+        x, y, cw, ch = screen
+        self.width, self.height = cw, ch
+        self._embedded = False
+        style = WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN
+        ex = (
+            WS_EX_NOACTIVATE
+            | WS_EX_TOOLWINDOW
+            | WS_EX_LAYERED
+            | WS_EX_TRANSPARENT
+            | WS_EX_TOPMOST
+        )
+        hwnd_p = user32.CreateWindowExW(
+            ex,
+            self._class_name,
+            self.title,
+            style,
+            x,
+            y,
+            cw,
+            ch,
+            HANDLE_PTR(game),
+            None,
+            inst,
+            None,
+        )
+        hwnd = _hwnd_int(hwnd_p)
+        if not hwnd:
+            return 0
+        self._decorate(hwnd)
+        user32.SetWindowPos(
+            HANDLE_PTR(hwnd),
+            HANDLE_PTR(HWND_TOPMOST),
+            x,
+            y,
+            cw,
+            ch,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+        )
+        user32.ShowWindow(HANDLE_PTR(hwnd), SW_SHOWNA)
+        return hwnd
+
+    def _decorate(self, hwnd: int) -> None:
+        try:
+            getter = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+            setter = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            style_ex = int(getter(HANDLE_PTR(hwnd), GWL_EXSTYLE) or 0)
+            extra = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+            if self.layered:
+                extra |= WS_EX_LAYERED
+            if self.click_through:
+                extra |= WS_EX_TRANSPARENT
+            extra |= WS_EX_TOPMOST
+            setter(HANDLE_PTR(hwnd), GWL_EXSTYLE, style_ex | extra)
+        except Exception:
+            pass
+        try:
+            user32.SetWindowDisplayAffinity(HANDLE_PTR(hwnd), WDA_EXCLUDEFROMCAPTURE)
+        except Exception:
+            pass
+
+    def _game_client_size(self, game: int) -> tuple[int, int] | None:
+        if not game or not user32.IsWindow(HANDLE_PTR(game)):
+            return None
+        rc = wintypes.RECT()
+        if not user32.GetClientRect(HANDLE_PTR(game), ctypes.byref(rc)):
+            return None
+        w = int(rc.right - rc.left)
+        h = int(rc.bottom - rc.top)
+        if w < 8 or h < 8:
+            return None
+        return w, h
+
+    def _game_client_screen(self, game: int) -> tuple[int, int, int, int] | None:
+        size = self._game_client_size(game)
+        if size is None:
+            return None
+        pt = wintypes.POINT(0, 0)
+        if not user32.ClientToScreen(HANDLE_PTR(game), ctypes.byref(pt)):
+            return None
+        return int(pt.x), int(pt.y), int(size[0]), int(size[1])
+
+    def _to_bgra(self, rgb: np.ndarray, *, keyed: bool = False) -> np.ndarray:
         src = np.ascontiguousarray(rgb, dtype=np.uint8)
         if src.ndim != 3 or src.shape[2] < 3:
             raise ValueError("overlay frame must be HxWx3")
         h, w = int(src.shape[0]), int(src.shape[1])
         if self._bgra is None or self._bgra.shape[0] != h or self._bgra.shape[1] != w:
             self._bgra = np.empty((h, w, 4), dtype=np.uint8)
-            self._bgra[:, :, 3] = 255
         self._bgra[:, :, 0] = src[:, :, 2]
         self._bgra[:, :, 1] = src[:, :, 1]
         self._bgra[:, :, 2] = src[:, :, 0]
+        if keyed and self.chroma_rgb is not None:
+            r, g, b = self.chroma_rgb
+            mask = (src[:, :, 0] == r) & (src[:, :, 1] == g) & (src[:, :, 2] == b)
+            self._bgra[:, :, 3] = np.where(mask, 0, 255).astype(np.uint8)
+            vis = ~mask
+            self._bgra[:, :, 0] = np.where(vis, self._bgra[:, :, 0], 0)
+            self._bgra[:, :, 1] = np.where(vis, self._bgra[:, :, 1], 0)
+            self._bgra[:, :, 2] = np.where(vis, self._bgra[:, :, 2], 0)
+        else:
+            self._bgra[:, :, 3] = 255
         return self._bgra
+
+    def _release_dib(self) -> None:
+        try:
+            if self._hdc_mem and self._hbm_old:
+                gdi32.SelectObject(HANDLE_PTR(self._hdc_mem), HANDLE_PTR(self._hbm_old))
+        except Exception:
+            pass
+        try:
+            if self._hbm:
+                gdi32.DeleteObject(HANDLE_PTR(self._hbm))
+        except Exception:
+            pass
+        try:
+            if self._hdc_mem:
+                gdi32.DeleteDC(self._hdc_mem)
+        except Exception:
+            pass
+        self._hdc_mem = None
+        self._hbm = None
+        self._hbm_old = None
+        self._dib_bits = None
+        self._dib_wh = (0, 0)
+
+    def _ensure_dib(self, w: int, h: int) -> ctypes.c_void_p | None:
+        w, h = int(w), int(h)
+        if w < 1 or h < 1:
+            return None
+        if self._hdc_mem and self._dib_bits and self._dib_wh == (w, h):
+            return self._dib_bits
+        self._release_dib()
+        hdc_screen = user32.GetDC(None)
+        if not hdc_screen:
+            return None
+        try:
+            hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+        finally:
+            user32.ReleaseDC(None, hdc_screen)
+        if not hdc_mem:
+            return None
+        info = BITMAPINFO()
+        info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        info.bmiHeader.biWidth = w
+        info.bmiHeader.biHeight = -h
+        info.bmiHeader.biPlanes = 1
+        info.bmiHeader.biBitCount = 32
+        info.bmiHeader.biCompression = BI_RGB
+        bits = ctypes.c_void_p()
+        hbm = gdi32.CreateDIBSection(
+            hdc_mem,
+            ctypes.byref(info),
+            DIB_RGB_COLORS,
+            ctypes.byref(bits),
+            None,
+            0,
+        )
+        if not hbm or not bits.value:
+            gdi32.DeleteDC(hdc_mem)
+            return None
+        old = gdi32.SelectObject(HANDLE_PTR(hdc_mem), HANDLE_PTR(hbm))
+        self._hdc_mem = hdc_mem
+        self._hbm = hbm
+        self._hbm_old = old
+        self._dib_bits = bits
+        self._dib_wh = (w, h)
+        return bits
 
     def _blit(self, hdc) -> None:
         frame = self._last
@@ -593,9 +1394,42 @@ class Win32Overlay:
             SRCCOPY,
         )
 
+    def _present_layered(self, rgb: np.ndarray) -> None:
+        hwnd = self._hwnd
+        if not hwnd:
+            return
+        bgra = np.ascontiguousarray(self._to_bgra(rgb, keyed=True))
+        h, w = int(bgra.shape[0]), int(bgra.shape[1])
+        bits = self._ensure_dib(w, h)
+        if bits is None or self._hdc_mem is None:
+            return
+        ctypes.memmove(bits, bgra.ctypes.data, int(bgra.nbytes))
+        rc = wintypes.RECT()
+        if not user32.GetWindowRect(HANDLE_PTR(hwnd), ctypes.byref(rc)):
+            return
+        pt_dst = wintypes.POINT(int(rc.left), int(rc.top))
+        pt_src = wintypes.POINT(0, 0)
+        size = SIZE(w, h)
+        blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+        user32.UpdateLayeredWindow(
+            HANDLE_PTR(hwnd),
+            None,
+            ctypes.byref(pt_dst),
+            ctypes.byref(size),
+            self._hdc_mem,
+            ctypes.byref(pt_src),
+            0,
+            ctypes.byref(blend),
+            ULW_ALPHA,
+        )
+        self.width, self.height = w, h
+
     def _present(self, rgb: np.ndarray) -> None:
         hwnd = self._hwnd
         if not hwnd:
+            return
+        if self.layered and self.chroma_rgb is not None:
+            self._present_layered(rgb)
             return
         self._last = self._to_bgra(rgb)
         hdc = user32.GetDC(HANDLE_PTR(hwnd))
@@ -626,6 +1460,51 @@ class Win32Overlay:
             self._blit(hdc)
         finally:
             user32.ReleaseDC(HANDLE_PTR(hwnd), hdc)
+
+    def _sync_follow(self) -> bool:
+        """Pin the HUD to the Minecraft client in screen space (never a GL child)."""
+        hwnd = self._hwnd
+        game = self.game_hwnd
+        if not hwnd or not game:
+            return False
+        try:
+            if not user32.IsWindow(HANDLE_PTR(game)) or user32.IsIconic(HANDLE_PTR(game)):
+                user32.ShowWindow(HANDLE_PTR(hwnd), SW_HIDE)
+                self._visible = False
+                return False
+            from atomspike.capture.window import is_window_foreground
+
+            if not is_window_foreground(game):
+                user32.ShowWindow(HANDLE_PTR(hwnd), SW_HIDE)
+                self._visible = False
+                return False
+            screen = self._game_client_screen(game)
+            if screen is None:
+                user32.ShowWindow(HANDLE_PTR(hwnd), SW_HIDE)
+                self._visible = False
+                return False
+            self._embedded = False
+            pos = screen
+            self.width, self.height = pos[2], pos[3]
+            now = time.perf_counter()
+            moved = pos != self._last_pos
+            if moved or (now - self._last_z) > 0.25 or not self._visible:
+                user32.SetWindowPos(
+                    HANDLE_PTR(hwnd),
+                    HANDLE_PTR(HWND_TOPMOST),
+                    pos[0],
+                    pos[1],
+                    pos[2],
+                    pos[3],
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                )
+                user32.ShowWindow(HANDLE_PTR(hwnd), SW_SHOWNA)
+                self._last_pos = pos
+                self._last_z = now
+                self._visible = True
+            return True
+        except Exception:
+            return False
 
     def _drain(self) -> None:
         msg = wintypes.MSG()
@@ -667,6 +1546,14 @@ class Win32Overlay:
                 self._drain()
                 if not self.alive:
                     break
+                if self.follow and not self._sync_follow():
+                    next_t += period
+                    leftover = next_t - time.perf_counter()
+                    if leftover > 0:
+                        time.sleep(leftover)
+                    else:
+                        next_t = time.perf_counter()
+                    continue
                 if getattr(self, "_shm_buf", None) is not None:
                     try:
                         self._blit_shm()
@@ -708,45 +1595,8 @@ class Win32Overlay:
                     pass
 
 
-def _overlay_child_main(title, width, height, x, y, hz, buf, seq, alive_v, ready, stop, lock):
-    """Runs in a pythonw/detached process. Must not import torch."""
-    try:
-        try:
-            kernel32.FreeConsole()
-        except Exception:
-            pass
-        try:
-            con = _hwnd_int(kernel32.GetConsoleWindow())
-            if con:
-                user32.ShowWindow(HANDLE_PTR(con), 0)
-        except Exception:
-            pass
-        ov = Win32Overlay(
-            title=title,
-            width=int(width),
-            height=int(height),
-            x=x,
-            y=int(y),
-            hz=float(hz),
-            game_hwnd=0,
-        )
-        ov._shm_buf = buf
-        ov._shm_seq = seq
-        ov._shm_lock = lock
-        ov._alive_v = alive_v
-        ov._ready_evt = ready
-        ov._stop_evt = stop
-        ov._loop()
-    except Exception:
-        try:
-            alive_v.value = 0
-            ready.set()
-        except Exception:
-            pass
-
-
 class DetachedOverlay:
-    """Parent-side overlay: the HWND lives in another process so cmd cannot steal focus."""
+    """In-process overlay. A child pythonw process was pulling cmd back to the front."""
 
     def __init__(
         self,
@@ -759,125 +1609,24 @@ class DetachedOverlay:
         hz: float,
         game_hwnd: int = 0,
     ):
-        self.title = str(title)
-        self.width = max(8, int(width))
-        self.height = max(8, int(height))
-        self.x = x
-        self.y = int(y)
-        self.hz = max(10.0, float(hz))
+        self._inner = Win32Overlay(
+            title=title,
+            width=width,
+            height=height,
+            x=x,
+            y=y,
+            hz=hz,
+            game_hwnd=game_hwnd,
+        )
         self.game_hwnd = int(game_hwnd or 0)
-        self._alive_flag = False
-        self._composer = None
-        self._proc = None
-        self._feed = None
-        self._stop_feed = threading.Event()
-        self._ctx = mp.get_context("spawn")
-        n = self.width * self.height * 4
-        self._buf = self._ctx.Array("B", n)
-        self._seq = self._ctx.Value("Q", 0)
-        self._alive_v = self._ctx.Value("i", 0)
-        self._ready = self._ctx.Event()
-        self._stop = self._ctx.Event()
-        self._lock = self._ctx.Lock()
-        self._bgra = np.empty((self.height, self.width, 4), dtype=np.uint8)
-        self._bgra[:, :, 3] = 255
 
     @property
     def alive(self) -> bool:
-        try:
-            child = int(self._alive_v.value) == 1
-        except Exception:
-            child = False
-        return bool(self._alive_flag) and child
+        return bool(self._inner.alive)
 
     def start(self, composer) -> bool:
-        self._composer = composer
-        saved_exe = sys.executable
-        try:
-            mp.set_executable(_pythonw_executable())
-            self._proc = self._ctx.Process(
-                target=_overlay_child_main,
-                args=(
-                    self.title,
-                    self.width,
-                    self.height,
-                    self.x,
-                    self.y,
-                    self.hz,
-                    self._buf,
-                    self._seq,
-                    self._alive_v,
-                    self._ready,
-                    self._stop,
-                    self._lock,
-                ),
-                daemon=True,
-                name="atomspike-overlay",
-            )
-            self._proc.start()
-        finally:
-            try:
-                mp.set_executable(saved_exe)
-            except Exception:
-                pass
-        if not self._ready.wait(5.0) or int(self._alive_v.value) != 1:
-            self.close()
-            return False
-        self._alive_flag = True
-        self._stop_feed.clear()
-        self._feed = threading.Thread(target=self._feed_loop, name="overlay-feed", daemon=True)
-        self._feed.start()
-        return True
-
-    def _feed_loop(self) -> None:
-        period = 1.0 / self.hz
-        next_t = time.perf_counter()
-        n = self.width * self.height * 4
-        while not self._stop_feed.is_set() and not self._stop.is_set():
-            if self._composer is not None:
-                try:
-                    rgb = self._composer()
-                    if rgb is not None:
-                        src = np.ascontiguousarray(rgb, dtype=np.uint8)
-                        if src.shape[0] == self.height and src.shape[1] == self.width and src.shape[2] >= 3:
-                            self._bgra[:, :, 0] = src[:, :, 2]
-                            self._bgra[:, :, 1] = src[:, :, 1]
-                            self._bgra[:, :, 2] = src[:, :, 0]
-                            dest = np.frombuffer(self._buf.get_obj(), dtype=np.uint8, count=n).reshape(
-                                self.height, self.width, 4
-                            )
-                            with self._lock:
-                                np.copyto(dest, self._bgra)
-                                self._seq.value = int(self._seq.value) + 1
-                except Exception:
-                    pass
-            if int(self._alive_v.value) != 1:
-                break
-            next_t += period
-            leftover = next_t - time.perf_counter()
-            if leftover > 0:
-                time.sleep(leftover)
-            else:
-                next_t = time.perf_counter()
-        self._alive_flag = False
+        return self._inner.start(composer)
 
     def close(self) -> None:
-        self._alive_flag = False
-        self._stop_feed.set()
-        try:
-            self._stop.set()
-        except Exception:
-            pass
-        if self._feed is not None and self._feed.is_alive():
-            self._feed.join(timeout=0.8)
-        self._feed = None
-        proc = self._proc
-        self._proc = None
-        if proc is not None and proc.is_alive():
-            proc.join(timeout=1.2)
-            if proc.is_alive():
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+        self._inner.close()
 

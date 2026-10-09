@@ -52,10 +52,13 @@ class WSDScheduler:
     def __init__(self, optimizer: torch.optim.Optimizer, cfg: WSDConfig):
         self.optimizer = optimizer
         self.cfg = cfg
+        # Number of optimizer updates already completed.  The optimizer must
+        # always hold the LR for the *next* update because callers follow the
+        # standard ``optimizer.step(); scheduler.step()`` order.
         self.step_count = 0
         self.base_lrs = [g["lr"] for g in optimizer.param_groups]
         self.last_lrs = list(self.base_lrs)
-        self._apply(0.0)
+        self._apply(self._multiplier(0))
 
     # -- core curve -----------------------------------------------------
     def _multiplier(self, step: int) -> float:
@@ -85,9 +88,10 @@ class WSDScheduler:
 
     # -- public API -----------------------------------------------------
     def step(self) -> None:
-        # apply multiplier for the step we're about to take, then advance
-        self._apply(self._multiplier(self.step_count))
+        # Called after optimizer.step(): advance the completed-update counter
+        # and prepare the LR for the following optimizer update.
         self.step_count += 1
+        self._apply(self._multiplier(self.step_count))
 
     def get_last_lr(self) -> list[float]:
         return list(self.last_lrs)
@@ -111,7 +115,8 @@ class WSDScheduler:
         base = state.get("base_lrs")
         if base and len(base) == len(self.optimizer.param_groups):
             self.base_lrs = list(base)
-        # Reapply the multiplier for the next step so resume is exact.
+        # ``step`` is the number of completed optimizer updates, so this is
+        # precisely the multiplier required by the next one.
         self._apply(self._multiplier(self.step_count))
 
 

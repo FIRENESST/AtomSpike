@@ -1,10 +1,10 @@
-"""Time-based dual-rate clock: perception 5Hz, policy 30Hz.
+"""Time-based dual-rate clock: perception (default 10Hz) vs policy 30Hz.
 
 Call counting (tick % 6) is not a scheduler: eval tight-loops at thousands of
 Hz and play would not sleep. This clock has:
 
 - sim: each policy tick advances 1/policy_hz seconds; perception fires on
-  elapsed sim time (so 30 ticks => 5 perception updates at the default rates)
+  elapsed sim time (so 30 ticks => 10 perception updates at 10Hz)
 - realtime: uses perf_counter; optional pace sleeps to cap policy at 30Hz
 """
 
@@ -30,7 +30,7 @@ class DualRateDecision:
 class DualRateClock:
     def __init__(
         self,
-        perception_hz: float = 5.0,
+        perception_hz: float = 10.0,
         policy_hz: float = 30.0,
         mode: ClockMode = "sim",
         pace: bool = False,

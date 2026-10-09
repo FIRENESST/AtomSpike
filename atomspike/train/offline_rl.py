@@ -16,10 +16,16 @@ from tqdm import tqdm
 
 from atomspike.config import AtomSpikeConfig
 from atomspike.data.io import H5DemoDataset
-from atomspike.models.agent import AtomSpikeAgent
+from atomspike.data.rabc import require_informative_rewards
+from atomspike.models.iterator import task_forward_kwargs
+from atomspike.models.inventory import inventory_forward_kwargs
+from atomspike.models.sea import block_pulse_forward_kwargs
 from atomspike.train.common import (
     autocast_ctx,
+    backward_loss,
+    build_grad_scaler,
     build_scheduler_if_needed,
+    grad_accum_divisor,
     load_agent,
     make_loader,
     maybe_compile,
@@ -28,6 +34,7 @@ from atomspike.train.common import (
     save_checkpoint,
     set_seed,
 )
+from atomspike.data.augment import maybe_augment_frames
 from atomspike.train.optim import build_optimizer
 
 
@@ -37,6 +44,17 @@ def _logprob(logits: list[torch.Tensor], tokens: torch.Tensor) -> torch.Tensor:
         logp = torch.log_softmax(logit.float(), dim=-1)
         lp.append(logp.gather(1, tokens[:, i : i + 1]).squeeze(1))
     return torch.stack(lp, dim=1).sum(dim=1)
+
+
+def _categorical_kl(teacher_logits: list[torch.Tensor], student_logits: list[torch.Tensor]) -> torch.Tensor:
+    """KL(teacher || student), averaged equally across action slots."""
+    terms = []
+    for teacher, student in zip(teacher_logits, student_logits):
+        log_teacher = torch.log_softmax(teacher.float(), dim=-1)
+        teacher_prob = log_teacher.exp()
+        log_student = torch.log_softmax(student.float(), dim=-1)
+        terms.append((teacher_prob * (log_teacher - log_student)).sum(dim=-1))
+    return torch.stack(terms, dim=1).mean()
 
 
 def train_offline_rl(
@@ -50,6 +68,7 @@ def train_offline_rl(
     device = resolve_device(cfg.train.device)
     ds = H5DemoDataset.from_config(data_path, cfg)
     ds.assert_matches(cfg)
+    reward_info = require_informative_rewards(ds, purpose="offline RL")
     loader = make_loader(ds, cfg)
     agent = load_agent(teacher_ckpt, cfg, device)
     agent = maybe_compile(agent, cfg)
@@ -58,6 +77,7 @@ def train_offline_rl(
     for p in teacher.parameters():
         p.requires_grad = False
     opt = build_optimizer(cfg.train, agent.parameters())
+    scaler = build_grad_scaler(device, cfg.train.precision)
     # lower LR than BC: AW-BC on top of a warm-started policy is a fine-tune
     for g in opt.param_groups:
         g["lr"] = g["lr"] * 0.5
@@ -76,35 +96,38 @@ def train_offline_rl(
             frames = batch["frame"].to(device, non_blocking=True)
             prev = batch["prev_frame"].to(device, non_blocking=True)
             state = batch["game_state"].to(device, non_blocking=True)
+            frames, prev = maybe_augment_frames(frames, prev, cfg.train, game_state=state)
             tokens = batch["action"].to(device, non_blocking=True)
-            reward = batch["reward"].to(device, non_blocking=True)
+            returns = batch["return"].to(device, non_blocking=True)
             clock = batch["clock"].to(device, non_blocking=True) if "clock" in batch else None
+            task_kw = {**task_forward_kwargs(batch, device), **inventory_forward_kwargs(batch, device), **block_pulse_forward_kwargs(batch, device)}
             with autocast_ctx(device, cfg.train.precision):
-                out = agent(frames, state, tokens=tokens, prev_frames=prev, reason_tick=True, clock=clock)
+                out = agent(frames, state, tokens=tokens, prev_frames=prev, reason_tick=True, clock=clock, **task_kw)
                 with torch.no_grad():
-                    t_out = teacher(frames, state, tokens=tokens, prev_frames=prev, reason_tick=True, clock=clock)
-                    t_lp = _logprob(t_out["logits"], tokens)
-                    adv = reward - out["value"].detach().float()
+                    t_out = teacher(frames, state, tokens=tokens, prev_frames=prev, reason_tick=True, clock=clock, **task_kw)
+                    adv = returns - out["value"].detach().float()
                     w = torch.exp((adv / max(cfg.train.advantage_temp, 1e-3)).clamp(-8, 8))
                 lp = _logprob(out["logits"], tokens)
                 aw = -(w * lp).mean()
-                vloss = nn.functional.mse_loss(out["value"].float(), reward)
-                kl = (t_lp - lp).pow(2).mean()
-                loss = (aw + 0.5 * vloss + cfg.train.kl_coef * kl) / accum
-            loss.backward()
+                vloss = nn.functional.mse_loss(out["value"].float(), returns)
+                kl = _categorical_kl(t_out["logits"], out["logits"])
+                divisor = grad_accum_divisor(step, len(loader), accum)
+                loss = (aw + 0.5 * vloss + cfg.train.kl_coef * kl) / divisor
+            backward_loss(loss, scaler)
             if (step + 1) % accum == 0 or (step + 1) == len(loader):
-                optimizer_step(opt, sched, cfg.train.grad_clip, params)
+                optimizer_step(opt, sched, cfg.train.grad_clip, params, scaler=scaler)
                 opt.zero_grad(set_to_none=True)
-            running += float(loss.item()) * frames.size(0) * accum
+            running += float(loss.item()) * frames.size(0) * divisor
             n += frames.size(0)
         history.append(running / max(1, n))
     ckpt = save_checkpoint(
         agent,
         out_path,
-        extra={"offline_loss": history},
+        extra={"offline_loss": history, "reward_signal": reward_info},
         optimizer=opt,
         scheduler=sched,
+        scaler=scaler,
         keep_k=cfg.train.ckpt_keep_k,
         verify=cfg.train.ckpt_verify,
     )
-    return {"checkpoint": str(ckpt), "loss": history}
+    return {"checkpoint": str(ckpt), "loss": history, "reward_signal": reward_info}

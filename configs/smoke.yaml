@@ -27,6 +27,35 @@ planner:
   arrange: 0.7
   creative: false
   explore: 0.0
+  event_pool: 4
+
+groups:
+  enabled: true
+  n_groups: 8
+  n_heads: 2
+  specialist_hidden: 8
+
+sea:
+  enabled: true
+  k_events: 8
+  max_spatial: 64
+  n_heads: 2
+  block_amp: 0.08
+  block_onset: 0.2
+
+detect:
+  enabled: true
+  grid_h: 4
+  grid_w: 6
+  n_classes: 8
+  n_keep: 4
+  hidden: 16
+
+event_seq:
+  enabled: true
+  n_slots: 4
+  n_events: 12
+  n_heads: 2
 
 policy:
   kind: spike
@@ -39,6 +68,7 @@ action:
   n_keys: 4
   key_names: [W, A, S, D]
   mouse_bins: 11
+  wheel_bins: 1
 
 dual_rate:
   perception_hz: 5.0
@@ -51,6 +81,11 @@ train:
   lr: 0.001
   epochs: 6
   seed: 0
+
+learn:
+  enabled: false
+  max_new_events: 2
+  max_new_layers: 1
 
 env:
   kind: synthetic

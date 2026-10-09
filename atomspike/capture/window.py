@@ -85,10 +85,160 @@ def list_windows(title_substr: str = "") -> list[WindowInfo]:
     return found
 
 
+def hwnd_pid(hwnd: int) -> int:
+    if sys.platform != "win32" or int(hwnd or 0) <= 0:
+        return 0
+    import ctypes
+    from ctypes import wintypes
+
+    dummy = wintypes.DWORD()
+    ctypes.windll.user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(dummy))
+    return int(dummy.value)
+
+
+def root_hwnd(hwnd: int) -> int:
+    hwnd = int(hwnd or 0)
+    if sys.platform != "win32" or hwnd <= 0:
+        return hwnd
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    try:
+        if not user32.IsWindow(hwnd):
+            return 0
+    except Exception:
+        return 0
+    owner = int(user32.GetAncestor(hwnd, 3) or 0)
+    if owner:
+        return owner
+    return int(user32.GetAncestor(hwnd, 2) or hwnd)
+
+
+def hwnds_related(a: int, b: int) -> bool:
+    """True if both handles belong to the same top-level window or process."""
+    a, b = int(a or 0), int(b or 0)
+    if a <= 0 or b <= 0:
+        return False
+    if a == b:
+        return True
+    ra, rb = root_hwnd(a), root_hwnd(b)
+    if ra and rb and ra == rb:
+        return True
+    pa, pb = hwnd_pid(a), hwnd_pid(b)
+    return pa != 0 and pa == pb
+
+
+def foreground_hwnd() -> int:
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+
+    return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+
+
+def _gui_thread_hwnds() -> list[int]:
+    if sys.platform != "win32":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    class GUITHREADINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("flags", wintypes.DWORD),
+            ("hwndActive", wintypes.HWND),
+            ("hwndFocus", wintypes.HWND),
+            ("hwndCapture", wintypes.HWND),
+            ("hwndMenuOwner", wintypes.HWND),
+            ("hwndMoveSize", wintypes.HWND),
+            ("hwndCaret", wintypes.HWND),
+            ("rcCaret", wintypes.RECT),
+        ]
+
+    info = GUITHREADINFO()
+    info.cbSize = ctypes.sizeof(GUITHREADINFO)
+    if not ctypes.windll.user32.GetGUIThreadInfo(0, ctypes.byref(info)):
+        return []
+    out = []
+    for raw in (info.hwndActive, info.hwndFocus, info.hwndCapture):
+        h = int(raw or 0)
+        if h:
+            out.append(h)
+    return out
+
+
+def is_window_foreground(hwnd: int) -> bool:
+    """Whether `hwnd` (or a child/owner in the same process) is the foreground UI."""
+    hwnd = int(hwnd or 0)
+    if sys.platform != "win32":
+        return True
+    if hwnd <= 0:
+        return True
+    if hwnds_related(hwnd, foreground_hwnd()):
+        return True
+    return any(hwnds_related(hwnd, h) for h in _gui_thread_hwnds())
+
+
+def is_window_usable(hwnd: int) -> bool:
+    """Return whether a Windows target is real, visible, and not minimized.
+
+    Input injection has no safe fallback on another desktop platform, so this
+    deliberately returns false outside Windows.  This is separate from the
+    foreground check: a minimized window can briefly remain foreground while
+    its client capture is stale or blank.
+    """
+    hwnd = int(hwnd or 0)
+    if sys.platform != "win32" or hwnd <= 0:
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        return bool(
+            user32.IsWindow(hwnd)
+            and user32.IsWindowVisible(hwnd)
+            and not user32.IsIconic(hwnd)
+        )
+    except Exception:
+        return False
+
+
+def describe_foreground() -> str:
+    if sys.platform != "win32":
+        return "fg=n/a"
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    fg = foreground_hwnd()
+    if not fg:
+        return "fg=0"
+    cls = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(fg, cls, 256)
+    n = int(user32.GetWindowTextLengthW(fg) or 0)
+    title = ""
+    if n > 0:
+        buf = ctypes.create_unicode_buffer(n + 1)
+        user32.GetWindowTextW(fg, buf, n + 1)
+        title = (buf.value or "")[:48]
+    return f"fg={fg}:{(cls.value or '?')}:{title}"
+
+
+def _is_launcher_title(title: str) -> bool:
+    t = (title or "").lower()
+    return any(s in t for s in ("launcher", "install", "bootstrap", "curseforge", "modrinth app"))
+
+
 def pick_minecraft_window(title_substr: str = "Minecraft") -> WindowInfo | None:
     hits = list_windows(title_substr)
-    if hits:
-        return hits[0]
+    playable = [w for w in hits if not _is_launcher_title(w.title)]
+    pool = playable or hits
+    fg = foreground_hwnd()
+    if fg:
+        for w in pool:
+            if hwnds_related(w.hwnd, fg):
+                return w
+    if pool:
+        return pool[0]
     for alt in ("Lunar Client", "Badlion", "Feather", "Labymod", "Prism Launcher", "MultiMC"):
         hits = list_windows(alt)
         if hits:
@@ -349,6 +499,53 @@ def _hwnd_geometry(hwnd: int) -> WindowInfo | None:
     if w < 8 or h < 8:
         return None
     return WindowInfo(hwnd, buf.value, int(pt.x), int(pt.y), w, h)
+
+
+def clip_cursor_to_hwnd(hwnd: int, *, inset: int = 4) -> bool:
+    """Confine the OS cursor to the game client. No-op off Windows."""
+    if sys.platform != "win32" or int(hwnd or 0) <= 0:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    hwnd = int(hwnd)
+    if not user32.IsWindow(hwnd):
+        return False
+    try:
+        if user32.IsIconic(hwnd):
+            return False
+    except Exception:
+        pass
+    rc = wintypes.RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rc)):
+        return False
+    pt0 = wintypes.POINT(int(rc.left), int(rc.top))
+    pt1 = wintypes.POINT(int(rc.right), int(rc.bottom))
+    if not user32.ClientToScreen(hwnd, ctypes.byref(pt0)):
+        return False
+    if not user32.ClientToScreen(hwnd, ctypes.byref(pt1)):
+        return False
+    pad = max(0, int(inset))
+    left = int(pt0.x) + pad
+    top = int(pt0.y) + pad
+    right = int(pt1.x) - pad
+    bottom = int(pt1.y) - pad
+    if right - left < 16 or bottom - top < 16:
+        left, top, right, bottom = int(pt0.x), int(pt0.y), int(pt1.x), int(pt1.y)
+    box = wintypes.RECT(left, top, right, bottom)
+    return bool(user32.ClipCursor(ctypes.byref(box)))
+
+
+def unclip_cursor() -> None:
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.user32.ClipCursor(None)
+    except Exception:
+        pass
 
 
 def client_cursor_norm(win: WindowInfo | None) -> tuple[float, float]:

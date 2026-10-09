@@ -1,7 +1,7 @@
-"""8-slot action decoder: parallel heads, GRU AR (default), or tiny Transformer AR.
+"""N-slot action decoder: parallel heads, GRU AR (default), or tiny Transformer AR.
 
-GRU AR is the better 30Hz default: 8 tokens need sequential dependence
-(multi-key combos) but not a full decoder stack.
+GRU AR is the 30Hz default: slots need sequential dependence (multi-key combos)
+but not a full decoder stack. Minecraft uses 13 slots; smoke uses 8.
 """
 
 from __future__ import annotations
@@ -48,7 +48,31 @@ class ActionDecoder(nn.Module):
             return self._gru_ar(context, tokens)
         return self._tf_ar(context, tokens)
 
+    def sample(
+        self,
+        context: Tensor,
+        *,
+        temperature: float = 1.0,
+        deterministic: bool = False,
+    ) -> tuple[list[Tensor], Tensor]:
+        """Sample a coherent action and return the logits that produced it.
+
+        Autoregressive slots must be conditioned on the *sampled* prefix.  A
+        caller cannot first decode with greedy prefixes and then independently
+        sample the returned logits: later slots would belong to a different
+        policy trajectory and policy-gradient replay would be off-policy.
+        """
+        if self.mode == "parallel":
+            logits = [head(context) for head in self.heads]
+            return logits, _sample_slots(logits, temperature, deterministic)
+        if self.mode == "gru_ar":
+            return self._gru_sample(context, temperature, deterministic)
+        return self._tf_sample(context, temperature, deterministic)
+
     def _gru_ar(self, context: Tensor, tokens: Tensor | None) -> list[Tensor]:
+        if tokens is None:
+            logits, _ = self._gru_sample(context, 1.0, True)
+            return logits
         assert self.rnn is not None
         b = context.size(0)
         h = context
@@ -57,12 +81,30 @@ class ActionDecoder(nn.Module):
             inp = context + self.slot_embed.weight[i].unsqueeze(0).expand(b, -1)
             h = self.rnn(inp, h)
             logits_out.append(self.heads[i](h))
-            if tokens is not None:
-                tok = tokens[:, i].clamp(0, self.spec.slot_vocabs[i] - 1)
-            else:
-                tok = logits_out[-1].argmax(dim=-1)
+            tok = tokens[:, i].clamp(0, self.spec.slot_vocabs[i] - 1)
             h = h + self.token_embeds[i](tok)
         return logits_out
+
+    def _gru_sample(
+        self,
+        context: Tensor,
+        temperature: float,
+        deterministic: bool,
+    ) -> tuple[list[Tensor], Tensor]:
+        assert self.rnn is not None
+        b = context.size(0)
+        h = context
+        logits_out: list[Tensor] = []
+        tokens_out: list[Tensor] = []
+        for i in range(self.spec.n_slots):
+            inp = context + self.slot_embed.weight[i].unsqueeze(0).expand(b, -1)
+            h = self.rnn(inp, h)
+            logit = self.heads[i](h)
+            tok = _sample_one(logit, temperature, deterministic)
+            logits_out.append(logit)
+            tokens_out.append(tok)
+            h = h + self.token_embeds[i](tok)
+        return logits_out, torch.stack(tokens_out, dim=-1)
 
     def _tf_ar(self, context: Tensor, tokens: Tensor | None) -> list[Tensor]:
         assert self.decoder is not None
@@ -70,14 +112,7 @@ class ActionDecoder(nn.Module):
         memory = context.unsqueeze(1)
         learned = self.slot_embed.weight.unsqueeze(0).expand(b, -1, -1)
         if tokens is None:
-            decoded: list[Tensor] = []
-            so_far = learned[:, :1]
-            for i in range(self.spec.n_slots):
-                out = self.decoder(so_far, memory)[:, -1]
-                decoded.append(self.heads[i](out))
-                pred = decoded[-1].argmax(-1)
-                nxt = learned[:, i : i + 1] + self.token_embeds[i](pred).unsqueeze(1)
-                so_far = nxt if i == 0 else torch.cat([so_far, nxt], dim=1)
+            decoded, _ = self._tf_sample(context, 1.0, True)
             return decoded
         tok_emb = [
             self.token_embeds[i](tokens[:, i].clamp(0, self.spec.slot_vocabs[i] - 1))
@@ -90,3 +125,43 @@ class ActionDecoder(nn.Module):
         causal = torch.triu(torch.ones(n, n, device=context.device), diagonal=1).bool()
         out = self.decoder(tgt, memory, tgt_mask=causal)
         return [self.heads[i](out[:, i]) for i in range(n)]
+
+    def _tf_sample(
+        self,
+        context: Tensor,
+        temperature: float,
+        deterministic: bool,
+    ) -> tuple[list[Tensor], Tensor]:
+        assert self.decoder is not None
+        b = context.size(0)
+        memory = context.unsqueeze(1)
+        learned = self.slot_embed.weight.unsqueeze(0).expand(b, -1, -1)
+        # This is exactly the shifted prefix used by the teacher-forcing path:
+        # slot zero sees a zero BOS token, slot i sees tokens [0, i).
+        so_far = torch.zeros_like(learned[:, :1])
+        logits_out: list[Tensor] = []
+        tokens_out: list[Tensor] = []
+        for i in range(self.spec.n_slots):
+            n = int(so_far.size(1))
+            causal = torch.triu(
+                torch.ones(n, n, device=context.device, dtype=torch.bool), diagonal=1
+            )
+            out = self.decoder(so_far, memory, tgt_mask=causal)[:, -1]
+            logit = self.heads[i](out)
+            tok = _sample_one(logit, temperature, deterministic)
+            logits_out.append(logit)
+            tokens_out.append(tok)
+            if i + 1 < self.spec.n_slots:
+                nxt = learned[:, i : i + 1] + self.token_embeds[i](tok).unsqueeze(1)
+                so_far = torch.cat([so_far, nxt], dim=1)
+        return logits_out, torch.stack(tokens_out, dim=-1)
+
+
+def _sample_one(logit: Tensor, temperature: float, deterministic: bool) -> Tensor:
+    if deterministic or temperature <= 0:
+        return logit.argmax(dim=-1)
+    return torch.distributions.Categorical(logits=logit / max(float(temperature), 1e-5)).sample()
+
+
+def _sample_slots(logits: list[Tensor], temperature: float, deterministic: bool) -> Tensor:
+    return torch.stack([_sample_one(x, temperature, deterministic) for x in logits], dim=-1)

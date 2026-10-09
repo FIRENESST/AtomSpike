@@ -25,9 +25,27 @@ class ANNPolicy(nn.Module):
         self.trace_enabled = False
         self.last_trace: dict | None = None
 
-    def forward(self, context: Tensor, tokens: Tensor | None = None) -> dict[str, object]:
+    def forward(
+        self,
+        context: Tensor,
+        tokens: Tensor | None = None,
+        *,
+        sample_actions: bool = False,
+        action_temperature: float = 1.0,
+        deterministic_action: bool = False,
+    ) -> dict[str, object]:
+        if sample_actions and tokens is not None:
+            raise ValueError("sample_actions and teacher tokens are mutually exclusive")
         h = context + self.pre(context)
-        logits = self.decoder(h, tokens)
+        sampled_tokens = None
+        if sample_actions:
+            logits, sampled_tokens = self.decoder.sample(
+                h,
+                temperature=action_temperature,
+                deterministic=deterministic_action,
+            )
+        else:
+            logits = self.decoder(h, tokens)
         value = self.value_head(h).squeeze(-1)
         if self.trace_enabled and (not self.training):
             act = h.detach().float()[0].reshape(-1).cpu().numpy()
@@ -42,4 +60,9 @@ class ANNPolicy(nn.Module):
                 "sparsity": float(spk.mean()),
                 "v_th": 1.0,
             }
-        return {"logits": logits, "value": value, "spikes": None}
+        return {
+            "logits": logits,
+            "value": value,
+            "spikes": None,
+            "sampled_tokens": sampled_tokens,
+        }

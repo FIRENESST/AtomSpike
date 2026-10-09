@@ -1,0 +1,76 @@
+# Small CPU profile used by `atomspike verify` and `atomspike smoke`.
+encoder:
+  frame_size: 64
+  d_model: 64
+  stem_channels: [8, 16, 32]
+
+reasoner:
+  n_layers: 1
+  n_heads: 2
+  game_state_dim: 8
+  n_state_tokens: 2
+
+adapter:
+  hidden: 16
+
+planner:
+  latent_dim: 32
+  hidden: 64
+  n_phases: 8
+  n_plan_tokens: 2
+  future_steps: 4
+  future_near: 2
+  future_far: 6
+  creative: false
+  explore: 0.0
+  event_pool: 4
+
+groups:
+  n_groups: 8
+  n_heads: 2
+  specialist_hidden: 8
+
+sea:
+  k_events: 8
+  max_spatial: 64
+  n_heads: 2
+
+detect:
+  grid_h: 4
+  grid_w: 6
+  n_classes: 8
+  n_keep: 4
+  hidden: 16
+
+event_seq:
+  n_slots: 4
+  n_events: 12
+  n_heads: 2
+
+policy:
+  n_layers: 1
+  n_heads: 2
+  spike_time_steps: 1
+
+action:
+  n_keys: 4
+  key_names: [W, A, S, D]
+  mouse_bins: 11
+  wheel_bins: 1
+
+dual_rate:
+  perception_hz: 5.0
+
+train:
+  batch_size: 16
+  lr: 0.001
+  epochs: 6
+
+learn:
+  enabled: false
+  max_new_events: 2
+  max_new_layers: 1
+
+env:
+  kind: synthetic
+  max_steps: 48

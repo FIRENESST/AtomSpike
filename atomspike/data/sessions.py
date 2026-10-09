@@ -1,8 +1,9 @@
-"""Recording-session cuts and per-segment clocks.
+"""Episode cuts, independent recording IDs, and per-segment clocks.
 
-Appended HDF5 files are several independent captures, not one story.
-A gap in timestamps_ns (or an F8 done mark) closes a segment so prev-frame,
-future-state, and time_frac never cross the cut.
+An F8 mark closes an episode so prev-frame, future-state, and time_frac never
+cross it. Separately, validation uses collector-invocation IDs (with timestamp
+gaps as a legacy fallback), so an F8 press cannot leak adjacent video frames
+across train and validation.
 """
 
 from __future__ import annotations
@@ -80,40 +81,88 @@ def clock_from_runtime(session_t: float, dt_s: float, *, tau_s: float = 180.0) -
     return clock_vector(infer_time_frac(session_t, tau_s=tau_s), session_t, dt_s)
 
 
+def recording_ids(
+    n: int,
+    timestamps_ns: NDArray | None = None,
+    *,
+    dones: NDArray | None = None,
+    explicit_ids: NDArray | None = None,
+    forced_starts: NDArray | None = None,
+    gap_s: float = DEFAULT_GAP_S,
+) -> NDArray[np.int32]:
+    """Identify independent recordings without treating in-run F8 marks as recordings.
+
+    Current Minecraft files carry timestamps and an explicit ID written once
+    per collector invocation. Timestamp gaps remain a recovery fallback for
+    older files. Generic synthetic datasets have no timestamps, so only there
+    may terminal ``dones`` stand in for independent trajectories.
+    """
+    n = max(0, int(n))
+    if n == 0:
+        return np.zeros((0,), dtype=np.int32)
+    starts = np.zeros(n, dtype=bool)
+    starts[0] = True
+    if timestamps_ns is not None:
+        times = np.asarray(timestamps_ns, dtype=np.int64).reshape(-1)
+        if times.shape[0] != n:
+            raise ValueError("timestamps length mismatch")
+        delta = np.diff(times.astype(np.float64))
+        starts[1:] |= (delta > max(0.05, float(gap_s)) * 1e9) | (delta <= 0.0)
+    elif dones is not None:
+        ends = np.asarray(dones, dtype=np.uint8).reshape(-1)
+        if ends.shape[0] != n:
+            raise ValueError("dones length mismatch")
+        starts[1:] |= ends[:-1] > 0
+    if explicit_ids is not None:
+        raw = np.asarray(explicit_ids, dtype=np.int64).reshape(-1)
+        if raw.shape[0] != n:
+            raise ValueError("recording_id length mismatch")
+        if np.any(raw < 0):
+            raise ValueError("recording_id must be non-negative")
+        starts[1:] |= raw[1:] != raw[:-1]
+    if forced_starts is not None:
+        forced = np.asarray(forced_starts, dtype=bool).reshape(-1)
+        if forced.shape[0] != n:
+            raise ValueError("forced recording-start length mismatch")
+        starts |= forced
+    return (np.cumsum(starts, dtype=np.int32) - 1).astype(np.int32, copy=False)
+
+
 def stride_split_segments(
     n: int,
     val_frac: float,
     segment_id: NDArray | None = None,
 ) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-    """Validation stride inside each recording, not across the whole concatenated file."""
+    """Split by complete recordings so validation cannot see adjacent train frames.
+
+    A video frame is far too correlated with its neighbours for a frame-stride
+    split to be a meaningful validation set.  ``segment_id`` therefore denotes
+    a recording/episode, and whole trailing segments are reserved for
+    validation.  A single recording has no honest held-out split; callers get
+    an empty validation array and should report that fact instead of quietly
+    evaluating on training examples.
+    """
     if segment_id is None:
-        return _stride_split_flat(n, val_frac)
+        # There is no provenance that lets us prevent temporal leakage.  Keep
+        # every example for training rather than manufacture a misleading val
+        # score.
+        return np.arange(n, dtype=np.int64), np.zeros((0,), dtype=np.int64)
     ids = np.asarray(segment_id).reshape(-1)
     if ids.shape[0] != n:
         raise ValueError("segment_id length mismatch")
-    train_parts: list[NDArray[np.int64]] = []
-    val_parts: list[NDArray[np.int64]] = []
-    for sid in np.unique(ids):
-        idx = np.flatnonzero(ids == sid).astype(np.int64)
-        local_train, local_val = _stride_split_flat(int(idx.size), val_frac)
-        train_parts.append(idx[local_train])
-        if local_val.size:
-            val_parts.append(idx[local_val])
-    train = np.sort(np.concatenate(train_parts)) if train_parts else np.zeros((0,), dtype=np.int64)
-    val = np.sort(np.concatenate(val_parts)) if val_parts else np.zeros((0,), dtype=np.int64)
-    if train.size == 0:
+    ordered = np.unique(ids)
+    if val_frac <= 0.0 or ordered.size < 2:
         return np.arange(n, dtype=np.int64), np.zeros((0,), dtype=np.int64)
-    return train, val
-
-
-def _stride_split_flat(n: int, val_frac: float) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-    if val_frac <= 0.0 or n < 20:
-        idx = np.arange(n, dtype=np.int64)
-        return idx, np.zeros((0,), dtype=np.int64)
-    k = max(2, int(round(1.0 / min(0.5, float(val_frac)))))
-    val = np.arange(k - 1, n, k, dtype=np.int64)
-    train = np.setdiff1d(np.arange(n, dtype=np.int64), val, assume_unique=True)
+    n_val_segments = min(
+        int(ordered.size) - 1,
+        max(1, int(math.ceil(float(val_frac) * int(ordered.size)))),
+    )
+    val_ids = ordered[-n_val_segments:]
+    val_mask = np.isin(ids, val_ids)
+    val = np.flatnonzero(val_mask).astype(np.int64)
+    train = np.flatnonzero(~val_mask).astype(np.int64)
     if train.size == 0 or val.size == 0:
+        # Defensive fallback for malformed ids; never return an all-val split.
         idx = np.arange(n, dtype=np.int64)
         return idx, np.zeros((0,), dtype=np.int64)
     return train, val
@@ -131,7 +180,7 @@ def build_episode_timeline(
     future_far: int = 45,
     fps: float = 30.0,
 ) -> dict[str, object]:
-    """Per-segment clocks and near-future game_state (never across a recording cut)."""
+    """Per-episode clocks and near-future game_state (never across an episode cut)."""
     states = np.asarray(states)
     raw_dones = np.asarray(dones).reshape(-1)
     n = int(states.shape[0])

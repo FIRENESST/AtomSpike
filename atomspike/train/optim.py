@@ -194,9 +194,9 @@ class CombinedOptimizer:
     def step(self, closure=None):
         loss = None
         for o in self.opts:
-            l = o.step(closure)
-            if l is not None:
-                loss = l
+            current_loss = o.step(closure)
+            if current_loss is not None:
+                loss = current_loss
         return loss
 
     def state_dict(self) -> dict:

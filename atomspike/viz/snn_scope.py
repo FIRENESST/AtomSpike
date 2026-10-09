@@ -15,8 +15,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-WIN_W = 512
-WIN_H = 784
+WIN_W = 768
+WIN_H = 980
 BG = (8, 11, 16)
 PANEL = (14, 19, 27)
 LINE = (32, 44, 58)
@@ -26,6 +26,9 @@ CYAN = (90, 228, 255)
 AMBER = (255, 186, 74)
 GREEN = (86, 232, 164)
 MAGENTA = (255, 92, 176)
+ITER_AUX_LABELS = ("进度", "GUI", "暂停", "背包", "视野", "死亡", "看空", "成就")
+_PAD = 12
+_INSET = 22
 
 
 def dummy_payload(n: int = 64, layers: int = 1) -> dict:
@@ -54,21 +57,49 @@ def dummy_payload(n: int = 64, layers: int = 1) -> dict:
         "v_th": 1.0,
         "plan_mix": mix,
         "plan_z": rng.normal(0, 0.4, 32).astype(np.float32),
-        "slot_names": ["W", "A", "S", "D", "MX", "MY", "LMB", "RMB"],
-        "slot_kinds": ["key", "key", "key", "key", "mouse_axis", "mouse_axis", "mouse_btn", "mouse_btn"],
-        "tokens": [2, 0, 0, 0, 20, 20, 0, 0],
+        "slot_names": ["W", "A", "S", "D", "SPACE", "SHIFT", "CTRL", "E", "MX", "MY", "LMB", "RMB", "WHL"],
+        "slot_kinds": ["key"] * 8 + ["mouse_axis", "mouse_axis", "mouse_btn", "mouse_btn", "wheel"],
+        "tokens": [2, 0, 0, 0, 0, 0, 0, 0, 20, 20, 0, 0, 5],
         "keys": {"W": "hold", "A": "idle", "S": "idle", "D": "idle"},
         "mouse": {"dx": 4.0, "dy": -2.0, "nx": 0.5, "ny": 0.5, "buttons": {"LMB": "idle", "RMB": "idle"}},
         "latency_ms": 4.2,
         "perception": True,
         "policy_hz": 30.0,
-        "perception_hz": 5.0,
+        "perception_hz": 10.0,
         "viz_hz": 120.0,
+        "iter_task": "story/mine_stone",
+        "iter_task_id": 2,
+        "iter_aux": np.array([0.4, 0.0, 0.0, 0.0, 0.6, 0.0, 0.0, 0.1], dtype=np.float32),
+        "iter_change": 0.42,
+        "iter_grid": rng.random(24).astype(np.float32),
+        "iter_h": rng.normal(0, 0.3, 32).astype(np.float32),
+        "iter_bias": 0.08,
+        "iter_hw": 4,
+        "iter_gh": 4,
+        "iter_gw": 6,
+        "iter_hold": False,
+        "curl_energy": 0.0,
+        "group_energy": rng.random(8).astype(np.float32),
+        "group_alive": 0,
+        "group_n": 8,
+        "sea_mask": (rng.random(64) > 0.8).astype(np.float32),
+        "sea_k": 8,
+        "sea_n": 64,
+        "sea_energy": 0.22,
+        "event_order": rng.random(8).astype(np.float32),
+        "event_n": 8,
+        "iter_frac": 0.4,
+        "inv_hand": "stone_pickaxe",
+        "inv_hover": "cobblestone",
+        "inv_carry": "-",
+        "inv_n": 6.0,
+        "inv_spike": 0.12,
+        "inv_bias": 0.03,
     }
 
 
 class ScopeBuffers:
-    def __init__(self, raster_cols: int = 168, raster_rows: int = 72):
+    def __init__(self, raster_cols: int = 220, raster_rows: int = 72):
         self.raster_cols = int(raster_cols)
         self.raster_rows = int(raster_rows)
         self.raster = np.zeros((self.raster_rows, self.raster_cols), dtype=np.float32)
@@ -121,9 +152,9 @@ _FONT_LG = None
 def _fonts():
     global _FONT_SM, _FONT_MD, _FONT_LG
     if _FONT_SM is None:
-        _FONT_SM = _font(13)
-        _FONT_MD = _font(15)
-        _FONT_LG = _font(18)
+        _FONT_SM = _font(14)
+        _FONT_MD = _font(16)
+        _FONT_LG = _font(20)
     return _FONT_SM, _FONT_MD, _FONT_LG
 
 
@@ -229,6 +260,52 @@ def _paint_bars(canvas, values, x, y, w, h, color) -> None:
         canvas[py : py + bh, px : px + bw] = color
 
 
+def _paint_meter(canvas, t: float, x, y, w, h, color) -> None:
+    t = float(np.clip(t, 0.0, 1.0))
+    _fill(canvas, x, y, w, h, (10, 14, 20))
+    _border(canvas, x, y, w, h, LINE)
+    inner = max(1, int(t * max(1, w - 4)))
+    canvas[y + 2 : y + h - 2, x + 2 : x + 2 + inner] = color
+
+
+def _paint_spatial_map(canvas, values, x, y, w, h, shape: tuple[int, int] | None = None) -> None:
+    values = _f32(values)
+    n = max(1, int(values.size))
+    if shape is not None and int(shape[0]) >= 2 and int(shape[1]) >= 2:
+        rows, cols = int(shape[0]), int(shape[1])
+    else:
+        cols = max(2, int(round(n ** 0.5)))
+        rows = max(2, int(round(n / max(1, cols))))
+        if rows * cols < n:
+            cols = max(cols, (n + rows - 1) // rows)
+    pad = np.zeros(rows * cols, dtype=np.float32)
+    pad[: min(n, pad.size)] = values[: min(n, pad.size)]
+    floor = float(np.median(pad))
+    pad = np.clip(pad - floor, 0.0, None)
+    mx = float(pad.max())
+    if mx < 1e-5:
+        t = np.zeros((rows, cols), dtype=np.float32)
+    else:
+        t = np.clip(pad / mx, 0.0, 1.0).reshape(rows, cols)
+    gap = 2
+    cell = max(4, min((w - (cols + 1) * gap) // cols, (h - (rows + 1) * gap) // rows))
+    ox = x + (w - (cell * cols + gap * (cols + 1))) // 2
+    oy = y + (h - (cell * rows + gap * (rows + 1))) // 2
+    _fill(canvas, x, y, w, h, (10, 14, 20))
+    _border(canvas, x, y, w, h, LINE)
+    for r in range(rows):
+        for c in range(cols):
+            v = float(t[r, c])
+            col = (
+                int(18 + (AMBER[0] - 18) * v),
+                int(16 + (AMBER[1] - 16) * v),
+                int(22 + (AMBER[2] - 22) * v),
+            )
+            px = ox + gap + c * (cell + gap)
+            py = oy + gap + r * (cell + gap)
+            canvas[py : py + cell, px : px + cell] = col
+
+
 def _downsample(vec: np.ndarray, rows: int) -> np.ndarray:
     vec = _f32(vec)
     if vec.size == rows:
@@ -298,47 +375,75 @@ def compose_frame(payload: dict | None, buf: ScopeBuffers, dt: float = 1.0 / 120
     else:
         buf.raster *= 0.996
 
+    pad, inset = _PAD, _INSET
+    panel_w = WIN_W - 2 * pad
+    content_w = WIN_W - 2 * inset
+    map_w, map_h = 240, 118
+    map_x, map_y = inset, 678
+    rest_x = map_x + map_w + 12
+    rest_w = max(120, WIN_W - rest_x - inset)
+    half = max(48, (rest_w - 8) // 2)
+
     canvas = np.empty((WIN_H, WIN_W, 3), dtype=np.uint8)
     canvas[:] = BG
-    _panel(canvas, 12, 12, WIN_W - 24, 64)
-    _panel(canvas, 12, 86, WIN_W - 24, 188)
-    _panel(canvas, 12, 284, WIN_W - 24, 118)
-    _panel(canvas, 12, 412, WIN_W - 24, 132)
-    _panel(canvas, 12, 554, WIN_W - 24, 86)
-    _panel(canvas, 12, 650, WIN_W - 24, 122)
+    _panel(canvas, pad, 12, panel_w, 64)
+    _panel(canvas, pad, 86, panel_w, 188)
+    _panel(canvas, pad, 284, panel_w, 118)
+    _panel(canvas, pad, 412, panel_w, 132)
+    _panel(canvas, pad, 554, panel_w, 86)
+    _panel(canvas, pad, 650, panel_w, 150)
+    _panel(canvas, pad, 810, panel_w, 154)
 
-    _paint_grid(canvas, in_mem, buf.glow_in, 22, 118, WIN_W - 44, 146, v_th)
+    _paint_grid(canvas, in_mem, buf.glow_in, inset, 118, content_w, 146, v_th)
 
     strip_y = 316
     n_lay = max(1, len(layers))
-    sw = (WIN_W - 48 - 8 * (n_lay - 1)) // n_lay
+    sw = (content_w - 8 * (n_lay - 1)) // n_lay
     if layers:
         for i, layer in enumerate(layers):
-            sx = 22 + i * (sw + 8)
+            sx = inset + i * (sw + 8)
             _paint_grid(canvas, layer.get("mem"), buf.glow_layers[i], sx, strip_y, sw, 76, v_th)
     else:
-        _paint_grid(canvas, in_mem, buf.glow_in, 22, strip_y, WIN_W - 44, 76, v_th)
+        _paint_grid(canvas, in_mem, buf.glow_in, inset, strip_y, content_w, 76, v_th)
 
-    _paint_raster(canvas, buf.raster, 22, 444, WIN_W - 44, 64)
-    _paint_bars(canvas, buf.rate, 22, 512, WIN_W - 44, 22, GREEN)
+    _paint_raster(canvas, buf.raster, inset, 444, content_w, 64)
+    _paint_bars(canvas, buf.rate, inset, 512, content_w, 22, GREEN)
 
     mix = payload.get("plan_mix")
     z = payload.get("plan_z")
     if mix is None:
         mix = np.zeros(8, np.float32)
-    _paint_bars(canvas, mix, 22, 586, WIN_W - 44, 44, MAGENTA)
+    _paint_bars(canvas, mix, inset, 586, content_w, 44, MAGENTA)
     if z is not None:
-        _paint_bars(canvas, np.abs(_f32(z))[:48], 22, 586, WIN_W - 44, 12, (90, 110, 160))
+        _paint_bars(canvas, np.abs(_f32(z))[:48], inset, 586, content_w, 12, (90, 110, 160))
+    ge = payload.get("group_energy")
+    if ge is not None:
+        _paint_bars(canvas, ge, inset, 638, content_w, 10, AMBER)
+
+    grid = payload.get("iter_grid")
+    gh = max(2, int(payload.get("iter_gh") or 4))
+    gw = max(2, int(payload.get("iter_gw") or 6))
+    if grid is None:
+        grid = np.zeros(gh * gw, dtype=np.float32)
+    _paint_spatial_map(canvas, grid, map_x, map_y, map_w, map_h, shape=(gh, gw))
+    change = float(payload.get("iter_change") or 0.0)
+    frac = float(payload.get("iter_frac") or 0.0)
+    bias_t = float(np.clip(float(payload.get("iter_bias") or 0.0) / 0.25, 0.0, 1.0))
+    _paint_meter(canvas, change, rest_x, map_y, rest_w, 12, AMBER)
+    _paint_bars(canvas, payload.get("iter_h"), rest_x, map_y + 18, rest_w, 34, CYAN)
+    _paint_meter(canvas, max(change, frac), rest_x, map_y + 58, half, 10, GREEN)
+    _paint_meter(canvas, bias_t, rest_x + half + 8, map_y + 58, half, 10, MAGENTA)
 
     names = list(payload.get("slot_names") or [])
     kinds = list(payload.get("slot_kinds") or [])
     tokens = payload.get("tokens") or []
     keys = payload.get("keys") or {}
     n_slots = max(len(names), len(tokens), 1)
-    gap = 6
-    bw = max(28, (WIN_W - 44 - gap * (n_slots - 1)) // n_slots)
+    gap = 8 if n_slots <= 10 else 6
+    bw = max(36, (content_w - gap * (n_slots - 1)) // n_slots)
+    key_y = 842
     for i in range(n_slots):
-        sx = 22 + i * (bw + gap)
+        sx = inset + i * (bw + gap)
         kind = kinds[i] if i < len(kinds) else "key"
         on = False
         if kind == "key" and i < len(names):
@@ -350,40 +455,109 @@ def compose_frame(payload: dict | None, buf: ScopeBuffers, dt: float = 1.0 / 120
         elif kind == "mouse_axis" and i < len(tokens) and tokens:
             center = 20
             on = abs(int(tokens[i]) - center) > 1
-        col = GREEN if on else (28, 36, 48)
-        _fill(canvas, sx, 682, bw, 54, col if on else (22, 28, 38))
-        _border(canvas, sx, 682, bw, 54, CYAN if on else LINE)
+        elif kind == "wheel" and i < len(tokens) and tokens:
+            center = 5
+            on = abs(int(tokens[i]) - center) > 0
+        _fill(canvas, sx, key_y, bw, 54, GREEN if on else (22, 28, 38))
+        _border(canvas, sx, key_y, bw, 54, CYAN if on else LINE)
 
     img = Image.fromarray(canvas, "RGB")
     draw = ImageDraw.Draw(img)
-    sm, md, lg = _fonts()
+    sm, _, lg = _fonts()
     kind = str(payload.get("kind") or "spike").upper()
-    title = "AtomSpike  ·  脉冲网络"
-    draw.text((24, 22), title, fill=TEXT, font=lg)
+    draw.text((inset + 2, 22), "AtomSpike  ·  脉冲网络", fill=TEXT, font=lg)
     hz = f"{float(viz_hz):.0f} Hz 窗口"
     live = f"{buf.fps:.0f} fps" if buf.fps else "—"
     sp = 100.0 * float(payload.get("sparsity") or 0.0)
     sub = f"{kind}   发放 {sp:.1f}%   可视化 {live} / {hz}   推理 {float(payload.get('latency_ms') or 0):.1f} ms"
-    draw.text((24, 46), sub, fill=MUTED, font=sm)
+    draw.text((inset + 2, 46), sub, fill=MUTED, font=sm)
     perc = "感知 tick" if payload.get("perception") else "复用语义"
     draw.text(
-        (24, 94),
+        (inset + 2, 94),
         f"输入 LIF 膜电位  ·  亮点是正在发放的神经元  ·  {perc}",
         fill=CYAN,
         font=sm,
     )
-    draw.text((24, 292), "策略层  ·  每层 MLP-LIF（膜 + 脉冲余辉）", fill=AMBER, font=sm)
-    draw.text((24, 420), "脉冲光栅  ·  时间向右  ·  下行是发放率", fill=GREEN, font=sm)
-    draw.text((24, 562), "自己安排的任务槽  ·  高柱 = 当前更想做的事", fill=MAGENTA, font=sm)
-    draw.text((24, 658), "键鼠输出  ·  亮着 = 这一拍按下 / 转头", fill=TEXT, font=sm)
+    draw.text((inset + 2, 292), "策略层  ·  每层 MLP-LIF（膜 + 脉冲余辉）", fill=AMBER, font=sm)
+    draw.text((inset + 2, 420), "脉冲光栅  ·  时间向右  ·  下行是发放率", fill=GREEN, font=sm)
+    draw.text((inset + 2, 562), "自己安排的任务槽  ·  高柱 = 当前更想做的事", fill=MAGENTA, font=sm)
+    task = str(payload.get("iter_task") or "空任务")
+    if "/" in task:
+        task = task.split("/")[-1]
+    hold = bool(payload.get("iter_hold"))
+    hold_txt = "GUI冻结" if hold else "世界视角"
+    curl_e = float(payload.get("curl_energy") or 0.0)
+    g_n = int(payload.get("group_n") or 0)
+    g_alive = int(payload.get("group_alive") or 0)
+    g_txt = f"  ·  集团 {g_alive}/{g_n}" if g_n > 0 else ""
+    sea_n = int(payload.get("sea_n") or 0)
+    sea_k = int(payload.get("sea_k") or 0)
+    sea_txt = f"  ·  符合 {sea_k}/{sea_n}" if sea_n > 0 else ""
+    det_n = int(payload.get("detect_n") or 0)
+    det_k = int(payload.get("detect_k") or 0)
+    kinds = payload.get("detect_kinds") or []
+    kind_s = ",".join(str(k) for k in kinds[:4]) if kinds else ""
+    det_txt = f"  ·  网格 {det_k}/{det_n}{(' ' + kind_s) if kind_s else ''}" if det_n > 0 else ""
+    ev_n = int(payload.get("event_n") or 0)
+    ev_txt = f"  ·  事件序 {ev_n}" if ev_n > 0 else ""
+    draw.text(
+        (inset + 2, 656),
+        f"10Hz 迭代器  ·  {gh}×{gw} 空间差  ·  {task}",
+        fill=AMBER,
+        font=sm,
+    )
+    draw.text(
+        (rest_x, 656),
+        f"变化 {change:.2f}  ·  旋度 {curl_e:.2f}  ·  {hold_txt}{g_txt}{sea_txt}{det_txt}{ev_txt}",
+        fill=AMBER,
+        font=sm,
+    )
+    aux = _f32(payload.get("iter_aux"), 8)
+    step = max(48, rest_w // max(1, len(ITER_AUX_LABELS)))
+    ax = rest_x
+    for i, name in enumerate(ITER_AUX_LABELS):
+        on = float(aux[i]) > 0.35 if i < aux.size else False
+        draw.text((ax, 752), name, fill=AMBER if on else MUTED, font=sm)
+        ax += step
+    hand = str(payload.get("inv_hand") or "-")
+    hover = str(payload.get("inv_hover") or "-")
+    inv_n = float(payload.get("inv_n") or 0.0)
+    draw.text(
+        (rest_x, 772),
+        f"物品 LIF  手:{hand[:16]}  悬:{hover[:16]}  n={inv_n:.0f}",
+        fill=CYAN,
+        font=sm,
+    )
+    draw.text((inset + 2, 818), "键鼠输出  ·  亮着 = 这一拍按下 / 转头 / 滚轮", fill=TEXT, font=sm)
+    max_ch = 6 if bw >= 52 else (5 if bw >= 42 else 4)
     for i, name in enumerate(names[:n_slots]):
-        sx = 22 + i * (bw + gap)
-        label = str(name)[:4]
-        draw.text((sx + 6, 690), label, fill=TEXT, font=sm)
+        sx = inset + i * (bw + gap)
+        draw.text((sx + 4, 850), str(name)[:max_ch], fill=TEXT, font=sm)
     mouse = payload.get("mouse") or {}
     dx, dy = float(mouse.get("dx") or 0.0), float(mouse.get("dy") or 0.0)
-    draw.text((24, 748), f"关闭本窗口即停止预测    鼠标 Δ {dx:+.1f}, {dy:+.1f}", fill=MUTED, font=sm)
+    wheel = float(mouse.get("wheel") or 0.0)
+    draw.text(
+        (inset + 2, 932),
+        f"关掉本窗口不停，F9 才停    鼠标 Δ {dx:+.1f}, {dy:+.1f}    轮 {wheel:+.1f}",
+        fill=MUTED,
+        font=sm,
+    )
     return np.asarray(img, dtype=np.uint8)
+
+
+def _overlay_origin() -> tuple[int, int]:
+    """Park the monitor on the right so it does not sit on the Minecraft window."""
+    y = 40
+    x = 24
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            sw = int(ctypes.windll.user32.GetSystemMetrics(0) or 1280)
+            x = max(16, sw - WIN_W - 24)
+    except Exception:
+        x = 24
+    return x, y
 
 
 def _noactivate(hwnd) -> None:
@@ -443,6 +617,13 @@ def _restore_focus(hwnd) -> None:
     if not hwnd:
         return
     try:
+        from atomspike.viz.overlay_win import restore_game_focus
+
+        restore_game_focus(int(hwnd), park_cursor=False, allow_alt=False)
+        return
+    except Exception:
+        pass
+    try:
         import ctypes
         from ctypes import wintypes
 
@@ -451,8 +632,14 @@ def _restore_focus(hwnd) -> None:
         hwnd = int(hwnd)
         if not user32.IsWindow(hwnd):
             return
-        if int(user32.GetForegroundWindow() or 0) == hwnd:
-            return
+        try:
+            from atomspike.capture.window import hwnds_related
+
+            if hwnds_related(int(user32.GetForegroundWindow() or 0), hwnd):
+                return
+        except Exception:
+            if int(user32.GetForegroundWindow() or 0) == hwnd:
+                return
         try:
             user32.AllowSetForegroundWindow(-1)
         except Exception:
@@ -501,7 +688,7 @@ def _decorate_overlay(hwnd, x: int | None = None, y: int | None = None) -> None:
 class SNNScope:
     """120Hz overlay. Prefers pygame on a side thread; falls back to Tk."""
 
-    def __init__(self, hz: float = 120.0):
+    def __init__(self, hz: float = 60.0):
         self.hz = max(30.0, float(hz))
         self.backend = "none"
         self.alive = False
@@ -554,7 +741,7 @@ class SNNScope:
             width=WIN_W,
             height=WIN_H,
             x=None,
-            y=48,
+            y=_overlay_origin()[1],
             hz=self.hz,
             game_hwnd=self._game_hwnd,
         )
@@ -616,7 +803,8 @@ class SNNScope:
     def _pygame_loop(self) -> None:
         try:
             os.environ.setdefault("SDL_VIDEO_ALLOW_SCREENSAVER", "1")
-            os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "40,48")
+            ox, oy = _overlay_origin()
+            os.environ.setdefault("SDL_VIDEO_WINDOW_POS", f"{ox},{oy}")
             os.environ.setdefault("SDL_HINT_FORCE_RAISEWINDOW", "0")
             os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
             import pygame
@@ -629,10 +817,10 @@ class SNNScope:
                 info = pygame.display.Info()
                 x = max(16, int(getattr(info, "current_w", 1280) or 1280) - WIN_W - 24)
             except Exception:
-                x = 40
+                x = ox
             wm = pygame.display.get_wm_info() if hasattr(pygame.display, "get_wm_info") else {}
             hwnd = wm.get("window")
-            _decorate_overlay(hwnd, x, 48)
+            _decorate_overlay(hwnd, x, oy)
             _restore_focus(self._game_hwnd)
             clock = pygame.time.Clock()
             self._ok = True
@@ -676,7 +864,8 @@ class SNNScope:
         root.withdraw()
         root.title("AtomSpike · 脉冲网络")
         root.configure(bg="#080b10")
-        root.geometry(f"{WIN_W}x{WIN_H}+40+48")
+        ox, oy = _overlay_origin()
+        root.geometry(f"{WIN_W}x{WIN_H}+{ox}+{oy}")
         root.resizable(False, False)
         try:
             root.attributes("-topmost", True)
@@ -692,7 +881,7 @@ class SNNScope:
         self.alive = True
         root.update_idletasks()
         hwnd = _tk_root_hwnd(root)
-        _decorate_overlay(hwnd, 40, 48)
+        _decorate_overlay(hwnd, ox, oy)
         _restore_focus(self._game_hwnd)
         self._tk_pump()
         return True

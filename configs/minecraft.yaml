@@ -10,16 +10,87 @@ encoder:
   frame_size: 160
   d_model: 128
   stem_channels: [16, 32, 64]
+  n_blocks_per_stage: 2
+  max_token_h: 12
+  max_token_w: 20
 
 reasoner:
-  n_layers: 2
+  n_layers: 3
   n_heads: 4
   game_state_dim: 19
   n_state_tokens: 4
+  dropout: 0.1
+  drop_path: 0.1
+  token_drop: 0.12
 
 adapter:
   enabled: true
   hidden: 32
+  down_h: 96
+  down_w: 160
+
+iterator:
+  enabled: true
+  hidden: 64
+  spatial_hw: 4
+  spatial_h: 4
+  spatial_w: 6
+  spatial_dim: 16
+  task_dim: 32
+  n_task_buckets: 16
+  change_aux: 0.04
+
+scene:
+  enabled: true
+  spatial_hw: 4
+  spatial_h: 4
+  spatial_w: 6
+  spatial_dim: 16
+
+groups:
+  enabled: true
+  n_groups: 8
+  n_heads: 2
+  specialist_hidden: 8
+  ema: 0.9
+  birth_energy: 0.25
+
+sea:
+  enabled: true
+  k_events: 12
+  max_spatial: 64
+  n_heads: 2
+  onset: 1.0
+  block_amp: 0.08
+  block_onset: 0.2
+
+detect:
+  enabled: true
+  grid_h: 6
+  grid_w: 10
+  n_classes: 8
+  n_keep: 8
+  hidden: 32
+
+event_seq:
+  enabled: true
+  n_slots: 8
+  n_events: 24
+  n_heads: 2
+
+thought:
+  enabled: true
+  n_cells: 8
+  steps: 3
+  hidden: 16
+
+inventory:
+  enabled: true
+  n_slots: 63
+  item_dim: 16
+  hidden: 32
+  n_buckets: 48
+  lif_steps: 2
 
 planner:
   enabled: true
@@ -35,13 +106,16 @@ planner:
   arrange: 0.7
   creative: true
   explore: 0.08
+  event_pool: 8
 
 policy:
   kind: spike
   n_layers: 2
   n_heads: 4
   action_decode: gru_ar
-  spike_time_steps: 2
+  dropout: 0.1
+  drop_path: 0.08
+  spike_time_steps: 1
 
 action:
   n_keys: 8
@@ -49,9 +123,11 @@ action:
   mouse_bins: 41
   mouse_delta_max: 240
   mouse_delta_scale: 16
+  wheel_bins: 11
+  wheel_max: 4.0
 
 dual_rate:
-  perception_hz: 5.0
+  perception_hz: 10.0
   policy_hz: 30.0
   mode: realtime
   pace: true
@@ -83,7 +159,55 @@ train:
   lr: 0.0003
   device: auto
   val_frac: 0.1
-  gui_sample_weight: 2.0
+  gui_sample_weight: 5.0
   motion_sample_weight: 5.0
   look_move_ce_boost: 4.0
+  gui_mouse_ce_boost: 5.0
   slot_balance: false
+  label_smoothing: 0.05
+  aug_brightness: 0.18
+  aug_contrast: 0.18
+  aug_saturation: 0.12
+  aug_noise: 0.02
+  aug_erase: 0.12
+  aug_erase_scale: 0.08
+
+learn:
+  enabled: false
+  lr: 0.0001
+  kl_coef: 0.1
+  value_coef: 0.5
+  entropy_coef: 0.01
+  reward_clip: 2.0
+  credit_steps: 4
+  credit_gamma: 0.9
+  buffer: 32
+  budget_ms: 5.0
+  max_new_events: 4
+  max_new_layers: 2
+  layer_hidden: 16
+  birth_surprise: 0.45
+  birth_cooldown_s: 8.0
+  save_every_s: 20.0
+  goal_reward: 1.0
+  hp_penalty: 0.2
+  sky_penalty: 0.06
+  sky_grace_s: 0.8
+  sky_pitch: -32.0
+  ground_penalty: 0.06
+  ground_grace_s: 5.0
+  ground_pitch: 40.0
+  look_bonus: 0.02
+  look_bins: 8
+  look_memory_s: 6.0
+  stall_s: 600.0
+  stall_penalty: 2.0
+  inv_penalty: 0.04
+  pause_penalty: 0.3
+  view_bonus: 0.05
+  jump_penalty: 0.05
+  circle_penalty: 0.06
+  circle_s: 3.5
+  idle_penalty: 0.08
+  idle_s: 30.0
+  idle_radius: 1.75

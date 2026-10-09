@@ -21,8 +21,14 @@ class Act(nn.Module):
         self.register_buffer("threshold", torch.zeros(()))
         self.register_buffer("scale", torch.ones(()))
         self.register_buffer("spike_mode", torch.zeros((), dtype=torch.uint8))
+        self._spike = False
+        self.register_load_state_dict_post_hook(Act._sync_spike)
+
+    def _sync_spike(self, *_args) -> None:
+        self._spike = bool(int(self.spike_mode.detach().cpu().item()))
 
     def set_spike(self, enabled: bool, threshold: float | None = None, scale: float | None = None) -> None:
+        self._spike = bool(enabled)
         self.spike_mode.fill_(1 if enabled else 0)
         if threshold is not None:
             self.threshold.fill_(float(threshold))
@@ -31,13 +37,13 @@ class Act(nn.Module):
 
     @property
     def is_spike(self) -> bool:
-        return int(self.spike_mode.item()) != 0
+        return self._spike
 
     def extra_repr(self) -> str:
         return f"kind={self.kind}, spike={self.is_spike}, th={float(self.threshold):.4f}"
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.is_spike:
+        if self._spike:
             return (x > self.threshold).to(dtype=x.dtype) * self.scale
         if self.kind == "gelu":
             return F.gelu(x)

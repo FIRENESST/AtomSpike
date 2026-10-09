@@ -1,6 +1,6 @@
-from atomspike.convert.pmsm import convert_checkpoint, enable_pmsm, pmsm_status
+from atomspike.convert.pmsm import calibrate_pmsm, convert_checkpoint, enable_pmsm, pmsm_status
 
-__all__ = ["convert_checkpoint", "convert_spiked_attention", "enable_pmsm", "pmsm_status"]
+__all__ = ["calibrate_pmsm", "convert_checkpoint", "convert_spiked_attention", "enable_pmsm", "pmsm_status"]
 
 
 def __getattr__(name):

@@ -9,7 +9,7 @@ from numpy.typing import NDArray
 
 from atomspike.config import ActionConfig
 from atomspike.envs.base import StepResult
-from atomspike.models.actions import KEY_HOLD, KEY_PRESS, ActionSpec, ActionStateMachine
+from atomspike.models.actions import ActionSpec, ActionStateMachine
 
 
 class ViZDoomEnv:

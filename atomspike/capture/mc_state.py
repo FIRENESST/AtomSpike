@@ -17,6 +17,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from atomspike.capture.nbt import extract_player, load_nbt, player_to_fields, singleplayer_uuid
+from atomspike.capture.sidecar import SIDECAR_FIELDS
 
 MC_FACT_FIELDS: tuple[str, ...] = ("x", "y", "z", "yaw", "pitch", "hp", "hunger", "hotbar_slot")
 MC_STATE_FIELDS: tuple[str, ...] = (
@@ -40,6 +41,87 @@ MC_STATE_FIELDS: tuple[str, ...] = (
     "cursor_y",
     "hovered_slot",
 )
+
+_SIDECAR_NUMBERS = frozenset(
+    {
+        "hp", "max_hp", "hunger", "air", "xp_progress", "x", "y", "z",
+        "yaw", "pitch", "vx", "vy", "vz", "hotbar_slot", "selected_count",
+        "mouse_nx", "mouse_ny", "hovered_slot", "carried_count", "adv_done",
+        "adv_next_frac", "sky_light", "blocks_seen", "broke", "placed",
+    }
+)
+_SIDECAR_FLAGS = frozenset(
+    {
+        "on_ground", "sneaking", "sprinting", "in_water", "gui_open", "mouse_grabbed",
+        "can_see_sky", "look_miss", "dead", "paused", "inv_open", "singleplayer",
+    }
+)
+_SIDECAR_TEXT = frozenset(
+    {"hand_item", "hover_item", "carry_item", "gui", "adv_next", "session_nonce", "look_block_id", "look_entity_id"}
+)
+_SIDECAR_LISTS = frozenset({"inv", "menu"})
+
+
+def _reject_json_constant(value: str) -> None:
+    """Make JSON NaN/Infinity invalid instead of poisoning a training tensor."""
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    """Coerce an external scalar only when it is finite; otherwise use default."""
+    if value is None or isinstance(value, bool):
+        return float(default)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return number if math.isfinite(number) else float(default)
+
+
+def sanitize_sidecar_payload(data: object) -> dict[str, Any] | None:
+    """Validate a small localhost sidecar object before it reaches live state.
+
+    UDP is local but still untrusted input.  Filtering here prevents a null or
+    NaN field from crashing capture, and prevents arbitrary nested blobs from
+    being persisted into a demo as accidental labels.
+    """
+    if not isinstance(data, dict) or len(data) > len(SIDECAR_FIELDS) + 8:
+        return None
+    clean: dict[str, Any] = {}
+    for key, value in data.items():
+        if key not in SIDECAR_FIELDS:
+            continue
+        if key in _SIDECAR_NUMBERS:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                return None
+            clean[key] = float(value)
+        elif key in _SIDECAR_FLAGS:
+            if not isinstance(value, bool):
+                return None
+            clean[key] = value
+        elif key in _SIDECAR_TEXT:
+            if not isinstance(value, str) or len(value) > 512:
+                return None
+            clean[key] = value
+        elif key in _SIDECAR_LISTS:
+            if not isinstance(value, list) or len(value) > 128:
+                return None
+            out: list[int | str] = []
+            for item in value:
+                if isinstance(item, bool):
+                    return None
+                if isinstance(item, int):
+                    out.append(item)
+                elif isinstance(item, float):
+                    if not math.isfinite(item):
+                        return None
+                    out.append(int(item))
+                elif isinstance(item, str) and len(item) <= 256:
+                    out.append(item)
+                else:
+                    return None
+            clean[key] = out
+    return clean
 
 
 def default_saves_dir() -> Path:
@@ -188,39 +270,66 @@ def probe_hud(frame: NDArray[np.uint8]) -> dict[str, float]:
     return out
 
 
+def sky_center_frac(frame: NDArray[np.uint8] | None) -> float:
+    """Fraction of the look-at (center) crop that looks like open sky / cloud.
+
+    Uses the crosshair region, not the top of the image, so a horizon view
+    with sky in the upper third does not count as staring at the sky.
+    """
+    if frame is None:
+        return 0.0
+    rgb = np.asarray(frame)
+    if rgb.ndim != 3 or rgb.shape[0] < 8 or rgb.shape[1] < 8:
+        return 0.0
+    h, w = int(rgb.shape[0]), int(rgb.shape[1])
+    y0, y1 = int(h * 0.28), max(int(h * 0.28) + 1, int(h * 0.72))
+    x0, x1 = int(w * 0.32), max(int(w * 0.32) + 1, int(w * 0.68))
+    patch = rgb[y0:y1:4, x0:x1:4, :3]
+    if patch.size == 0:
+        return 0.0
+    r = patch[:, :, 0].astype(np.int16)
+    g = patch[:, :, 1].astype(np.int16)
+    b = patch[:, :, 2].astype(np.int16)
+    lum = (r.astype(np.int32) + g + b) // 3
+    day = (b >= g) & (b > r + 12) & (lum > 85) & (g > 55)
+    cloud = (lum > 175) & (np.abs(r.astype(np.int32) - g) < 28) & (np.abs(g.astype(np.int32) - b) < 32)
+    dusk = (lum > 18) & (lum < 95) & (b > g + 6) & (b > r + 10) & (g < 85)
+    return float((day | cloud | dusk).mean())
+
+
 def fields_to_vector(src: dict[str, Any], dim: int = 16) -> NDArray[np.float32]:
-    hp = float(src.get("hp", 0.0))
-    max_hp = float(src.get("max_hp", 20.0) or 20.0)
-    hunger = float(src.get("hunger", 0.0))
-    air = float(src.get("air", 300.0))
-    yaw = float(src.get("yaw", 0.0))
-    pitch = float(src.get("pitch", 0.0))
+    hp = _finite_float(src.get("hp"), 0.0)
+    max_hp = _finite_float(src.get("max_hp"), 20.0)
+    hunger = _finite_float(src.get("hunger"), 0.0)
+    air = _finite_float(src.get("air"), 300.0)
+    yaw = _finite_float(src.get("yaw"), 0.0)
+    pitch = _finite_float(src.get("pitch"), 0.0)
     yaw_rad = math.radians(yaw)
-    vx = float(src.get("vx", 0.0))
-    vz = float(src.get("vz", 0.0))
+    vx = _finite_float(src.get("vx"), 0.0)
+    vz = _finite_float(src.get("vz"), 0.0)
     gui_open = bool(src.get("gui_open"))
-    held = float(src.get("selected_count", 0.0))
+    held = _finite_float(src.get("selected_count"), 0.0)
     if gui_open and src.get("carried_count") is not None:
-        held = float(src.get("carried_count") or 0.0)
-    cx = float(src.get("mouse_nx", src.get("cursor_x", 0.5)))
-    cy = float(src.get("mouse_ny", src.get("cursor_y", 0.5)))
-    hovered = float(src.get("hovered_slot", -1.0))
+        held = _finite_float(src.get("carried_count"), 0.0)
+    cx = _finite_float(src.get("mouse_nx", src.get("cursor_x")), 0.5)
+    cy = _finite_float(src.get("mouse_ny", src.get("cursor_y")), 0.5)
+    hovered = _finite_float(src.get("hovered_slot"), -1.0)
     vec = np.zeros(dim, dtype=np.float32)
     packed = [
         np.clip(hp / max(1.0, max_hp), 0.0, 1.5),
         np.clip(hunger / 20.0, 0.0, 1.5),
         np.clip(air / 300.0, 0.0, 1.5),
-        float(np.clip(src.get("xp_progress", 0.0), 0.0, 1.0)),
+        float(np.clip(_finite_float(src.get("xp_progress"), 0.0), 0.0, 1.0)),
         math.sin(yaw_rad),
         math.cos(yaw_rad),
         float(np.clip(pitch / 90.0, -1.0, 1.0)),
-        float(np.clip(float(src.get("hotbar_slot", src.get("hotbar", 0.0))) / 8.0, 0.0, 1.0)),
+        float(np.clip(_finite_float(src.get("hotbar_slot", src.get("hotbar")), 0.0) / 8.0, 0.0, 1.0)),
         1.0 if src.get("on_ground") else 0.0,
         1.0 if src.get("sneaking") else 0.0,
         1.0 if src.get("sprinting") else 0.0,
         1.0 if src.get("in_water") else 0.0,
         float(np.clip(math.sqrt(vx * vx + vz * vz) / 4.35, 0.0, 2.0)),
-        float(np.clip(float(src.get("y", 64.0)) / 256.0, 0.0, 2.0)),
+        float(np.clip(_finite_float(src.get("y"), 64.0) / 256.0, 0.0, 2.0)),
         float(np.clip(held / 64.0, 0.0, 1.0)),
         1.0 if gui_open else 0.0,
         float(np.clip(cx, 0.0, 1.0)),
@@ -295,6 +404,8 @@ class MinecraftStateHub:
         if extra:
             for k, v in extra.items():
                 merged.setdefault(k, v)
+        if frame is not None:
+            merged.setdefault("sky_frac", sky_center_frac(frame))
         kd = keys_down or {}
         merged.setdefault("sneaking", bool(kd.get("SHIFT")))
         merged.setdefault("sprinting", bool(kd.get("CTRL")))
@@ -310,17 +421,23 @@ class MinecraftStateHub:
         hot = m.get("hotbar_slot", m.get("hotbar", 0.0))
         return np.asarray(
             [
-                float(m.get("x", 0.0)),
-                float(m.get("y", 64.0)),
-                float(m.get("z", 0.0)),
-                float(m.get("yaw", 0.0)),
-                float(m.get("pitch", 0.0)),
-                float(m.get("hp", 0.0)),
-                float(m.get("hunger", 0.0)),
-                float(hot),
+                _finite_float(m.get("x"), 0.0),
+                _finite_float(m.get("y"), 64.0),
+                _finite_float(m.get("z"), 0.0),
+                _finite_float(m.get("yaw"), 0.0),
+                _finite_float(m.get("pitch"), 0.0),
+                _finite_float(m.get("hp"), 0.0),
+                _finite_float(m.get("hunger"), 0.0),
+                _finite_float(hot, 0.0),
             ],
             dtype=np.float32,
         )
+
+    def sidecar_age_s(self) -> float:
+        with self._lock:
+            if self._sidecar_t <= 0:
+                return 1e9
+            return time.time() - self._sidecar_t
 
     def source_name(self) -> str:
         with self._lock:
@@ -332,10 +449,6 @@ class MinecraftStateHub:
         if self.sidecar_path is not None and self.sidecar_path.is_file():
             return "file"
         return "hud"
-
-    def latest_debug(self) -> dict[str, Any]:
-        with self._lock:
-            return {"nbt": dict(self._nbt), "sidecar_age_s": time.time() - self._sidecar_t}
 
     def close(self) -> None:
         self._alive = False
@@ -354,9 +467,12 @@ class MinecraftStateHub:
             age = time.time() - self.sidecar_path.stat().st_mtime
             if age > 2.0:
                 return
-            data = json.loads(self.sidecar_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                merged.update(data)
+            data = json.loads(
+                self.sidecar_path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant
+            )
+            clean = sanitize_sidecar_payload(data)
+            if clean is not None:
+                merged.update(clean)
         except Exception:
             return
 
@@ -392,12 +508,13 @@ class MinecraftStateHub:
             if addr[0] not in {"127.0.0.1", "::1"}:
                 continue
             try:
-                data = json.loads(payload.decode("utf-8"))
+                data = json.loads(payload.decode("utf-8"), parse_constant=_reject_json_constant)
             except Exception:
                 continue
-            if isinstance(data, dict):
+            clean = sanitize_sidecar_payload(data)
+            if clean is not None:
                 with self._lock:
-                    self._sidecar = data
+                    self._sidecar = clean
                     self._sidecar_t = time.time()
         try:
             sock.close()

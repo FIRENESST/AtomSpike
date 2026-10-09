@@ -1,12 +1,13 @@
-"""8–12 slot atomic action space (keyboard + quantized mouse).
+"""8–13 slot atomic action space (keyboard + quantized mouse + optional wheel).
 
 Slots (n_keys=8 Minecraft default after aligned())
 -------------------------------------------------
 0-7   WASD SPACE SHIFT CTRL E  (idle / press / hold / release)
 8-9   look: mouse dx/dy bins; inventory/GUI: window-normalized cursor x/y
 10-11 LMB RMB (idle / press / hold / release). Shift-click = SHIFT key + LMB.
+12    wheel notches this tick (Minecraft hotbar / inventory scroll), if wheel_bins>=3.
 
-Smoke / synthetic keeps n_keys=4 → 8 slots total.
+Smoke / synthetic keeps n_keys=4 → 8 slots total (no wheel).
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ class ActionSpec:
     n_slots: int = 8
     mouse_delta_max: float = 10.0
     mouse_delta_scale: float = 4.0
+    wheel_bins: int = 1
+    wheel_max: float = 4.0
 
     @classmethod
     def from_config(cls, cfg: ActionConfig) -> "ActionSpec":
@@ -52,6 +55,8 @@ class ActionSpec:
             n_slots=cfg.n_slots,
             mouse_delta_max=float(cfg.mouse_delta_max),
             mouse_delta_scale=float(cfg.mouse_delta_scale),
+            wheel_bins=int(getattr(cfg, "wheel_bins", 1) or 1),
+            wheel_max=float(getattr(cfg, "wheel_max", 4.0) or 4.0),
         )
 
     @property
@@ -63,11 +68,25 @@ class ActionSpec:
         return self.mouse_bins // 2
 
     @property
+    def has_wheel(self) -> bool:
+        return int(self.wheel_bins) >= 3
+
+    @property
+    def wheel_center(self) -> int:
+        return max(0, int(self.wheel_bins) // 2)
+
+    @property
+    def wheel_index(self) -> int:
+        return self.n_keys + 2 + self.n_mouse_buttons
+
+    @property
     def slot_vocabs(self) -> tuple[int, ...]:
         keys = (self.n_key_states,) * self.n_keys
         mouse_xy = (self.mouse_bins, self.mouse_bins)
         btns = (self.n_key_states,) * self.n_mouse_buttons
         vocabs = keys + mouse_xy + btns
+        if self.has_wheel:
+            vocabs = vocabs + (int(self.wheel_bins),)
         if len(vocabs) != self.n_slots:
             raise ValueError(f"expected {self.n_slots} slots, got {len(vocabs)}")
         return vocabs
@@ -75,13 +94,25 @@ class ActionSpec:
     @property
     def slot_kinds(self) -> tuple[str, ...]:
         kinds = ("key",) * self.n_keys + ("mouse_axis", "mouse_axis") + ("mouse_btn",) * self.n_mouse_buttons
+        if self.has_wheel:
+            kinds = kinds + ("wheel",)
         return kinds
+
+    @property
+    def slot_names(self) -> tuple[str, ...]:
+        names = self.key_names + ("MX", "MY") + ("LMB", "RMB")[: self.n_mouse_buttons]
+        if self.has_wheel:
+            names = names + ("WHL",)
+        return names
 
     def idle_tokens(self) -> tuple[int, ...]:
         keys = (KEY_IDLE,) * self.n_keys
         mouse = (self.mouse_center, self.mouse_center)
         btns = (KEY_IDLE,) * self.n_mouse_buttons
-        return keys + mouse + btns
+        idle = keys + mouse + btns
+        if self.has_wheel:
+            idle = idle + (self.wheel_center,)
+        return idle
 
     def mouse_delta_to_bin(self, delta: float, max_abs: float | None = None) -> int:
         """Compress look deltas with asinh so flicks do not all saturate the last bin."""
@@ -118,6 +149,22 @@ class ActionSpec:
     def bin_to_mouse_unit(self, bin_id: int) -> float:
         last = max(1, self.mouse_bins - 1)
         return float(max(0, min(last, int(bin_id)))) / float(last)
+
+    def wheel_to_bin(self, notches: float) -> int:
+        arr = self.wheels_to_bins(np.asarray([notches], dtype=np.float64))
+        return int(arr[0])
+
+    def bin_to_wheel(self, bin_id: int) -> float:
+        radius = max(1, self.wheel_center)
+        y = (int(bin_id) - self.wheel_center) / float(radius)
+        y = max(-1.0, min(1.0, float(y)))
+        return float(y * self.wheel_max)
+
+    def wheels_to_bins(self, notches: NDArray[np.floating]) -> NDArray[np.int64]:
+        radius = max(1, self.wheel_center)
+        y = np.clip(np.asarray(notches, dtype=np.float64) / max(1e-6, self.wheel_max), -1.0, 1.0)
+        bins = np.rint(y * radius + self.wheel_center)
+        return np.clip(bins, 0, max(0, self.wheel_bins - 1)).astype(np.int64)
 
 
 class ActionStateMachine:
@@ -221,6 +268,9 @@ def tokens_to_controls(tokens: Tensor, spec: ActionSpec) -> dict[str, object]:
         "LMB": KEY_STATE_NAMES[int(tokens[spec.n_keys + 2].item())],
         "RMB": KEY_STATE_NAMES[int(tokens[spec.n_keys + 3].item())],
     }
+    wheel = 0.0
+    if spec.has_wheel and int(tokens.numel()) > spec.wheel_index:
+        wheel = spec.bin_to_wheel(int(tokens[spec.wheel_index].item()))
     return {
         "keys": keys,
         "mouse": {
@@ -229,20 +279,61 @@ def tokens_to_controls(tokens: Tensor, spec: ActionSpec) -> dict[str, object]:
             "nx": spec.bin_to_mouse_unit(mx),
             "ny": spec.bin_to_mouse_unit(my),
             "buttons": buttons,
+            "wheel": wheel,
         },
     }
 
 
+_SOFT_TABLES: dict[tuple, Tensor] = {}
+
+
+def _soft_table(kind: str, spec: ActionSpec, device, dtype) -> Tensor:
+    key = (
+        kind,
+        int(spec.mouse_bins),
+        float(spec.mouse_delta_max),
+        float(spec.mouse_delta_scale),
+        int(spec.wheel_bins),
+        float(spec.wheel_max),
+        str(device),
+        str(dtype),
+    )
+    tbl = _SOFT_TABLES.get(key)
+    if tbl is None or tbl.device != device:
+        if kind == "look":
+            vals = [spec.bin_to_mouse_delta(i) for i in range(spec.mouse_bins)]
+        elif kind == "cursor":
+            last = max(1, spec.mouse_bins - 1)
+            vals = [i / last for i in range(spec.mouse_bins)]
+        else:
+            vals = [spec.bin_to_wheel(i) for i in range(spec.wheel_bins)]
+        tbl = torch.tensor(vals, device=device, dtype=torch.float32)
+        _SOFT_TABLES[key] = tbl
+    return tbl.to(device=device, dtype=dtype)
+
+
 def look_deltas_from_logits(logits: list[Tensor], spec: ActionSpec) -> tuple[Tensor, Tensor]:
     """Soft look dx/dy. Argmax on the idle bin would otherwise never turn the camera."""
-    table = torch.tensor(
-        [spec.bin_to_mouse_delta(i) for i in range(spec.mouse_bins)],
-        device=logits[spec.n_keys].device,
-        dtype=torch.float32,
-    )
+    table = _soft_table("look", spec, logits[spec.n_keys].device, torch.float32)
     mx = torch.softmax(logits[spec.n_keys].float(), dim=-1) @ table
     my = torch.softmax(logits[spec.n_keys + 1].float(), dim=-1) @ table
     return mx, my
+
+
+def cursor_from_logits(logits: list[Tensor], spec: ActionSpec) -> tuple[Tensor, Tensor]:
+    """Soft window-normalized GUI cursor. Argmax of 41 bins is a 20px inventory snap."""
+    table = _soft_table("cursor", spec, logits[spec.n_keys].device, torch.float32)
+    nx = torch.softmax(logits[spec.n_keys].float(), dim=-1) @ table
+    ny = torch.softmax(logits[spec.n_keys + 1].float(), dim=-1) @ table
+    return nx, ny
+
+
+def wheel_from_logits(logits: list[Tensor], spec: ActionSpec) -> Tensor:
+    """Soft wheel notches. Center bin is rest; argmax would never scroll."""
+    if not spec.has_wheel:
+        return torch.zeros((), device=logits[0].device, dtype=torch.float32)
+    table = _soft_table("wheel", spec, logits[spec.wheel_index].device, torch.float32)
+    return torch.softmax(logits[spec.wheel_index].float(), dim=-1) @ table
 
 
 def retokenize_mouse_slots(
@@ -264,8 +355,14 @@ def retokenize_mouse_slots(
     if mouse_xy is not None:
         delta = np.asarray(mouse_xy, dtype=np.float64).reshape(-1, 2)[:n]
         mag = np.hypot(delta[:, 0], delta[:, 1])
-        # HUD often flags caves/sky as inventory; raw look deltas still mean look.
-        look = look | (mag > 3.0)
+        # HUD probe sometimes flags caves as inventory. Grabbed look keeps the
+        # OS cursor near the window center; a real GUI cursor leaves it.
+        if cursor_xy is not None:
+            cur = np.asarray(cursor_xy, dtype=np.float64).reshape(-1, 2)[:n]
+            parked = (np.abs(cur[:, 0] - 0.5) < 0.08) & (np.abs(cur[:, 1] - 0.5) < 0.08)
+            look = look | ((mag > 6.0) & parked)
+        else:
+            look = look | (mag > 8.0)
         out[look, mx_i] = spec.mouse_deltas_to_bins(delta[look, 0])
         out[look, my_i] = spec.mouse_deltas_to_bins(delta[look, 1])
     gui_cursor = gui & ~look
@@ -273,4 +370,35 @@ def retokenize_mouse_slots(
         cur = np.asarray(cursor_xy, dtype=np.float64).reshape(-1, 2)[:n]
         out[gui_cursor, mx_i] = spec.mouse_units_to_bins(cur[gui_cursor, 0])
         out[gui_cursor, my_i] = spec.mouse_units_to_bins(cur[gui_cursor, 1])
+    return out
+
+
+def attach_wheel_slot(
+    actions: NDArray[np.int64],
+    spec: ActionSpec,
+    wheel: NDArray[np.floating] | None = None,
+) -> NDArray[np.int64]:
+    """Pad old 12-slot demos and (re)tokenize WHL from stored notches."""
+    out = np.array(actions, dtype=np.int64, copy=True)
+    if out.ndim != 2:
+        raise ValueError(f"actions must be [N, slots], got {out.shape}")
+    n = int(out.shape[0])
+    notches = np.zeros(n, dtype=np.float64)
+    if wheel is not None:
+        notches = np.asarray(wheel, dtype=np.float64).reshape(-1)[:n]
+    if not spec.has_wheel:
+        return out[:, : spec.n_slots] if out.shape[1] > spec.n_slots else out
+    bins = spec.wheels_to_bins(notches).reshape(n, 1)
+    if out.shape[1] == spec.n_slots:
+        out[:, spec.wheel_index] = bins[:, 0]
+        return out
+    if out.shape[1] == spec.wheel_index:
+        return np.concatenate([out, bins], axis=1)
+    if out.shape[1] > spec.n_slots:
+        out = out[:, : spec.n_slots]
+        out[:, spec.wheel_index] = bins[:, 0]
+        return out
+    pad = np.zeros((n, spec.n_slots - out.shape[1]), dtype=np.int64)
+    out = np.concatenate([out, pad], axis=1)
+    out[:, spec.wheel_index] = bins[:, 0]
     return out

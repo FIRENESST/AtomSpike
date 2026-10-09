@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from atomspike.models.actions import (
     KEY_HOLD,
@@ -177,7 +177,7 @@ class InputTap:
             was = self._prev_keys[i]
             tokens.append(_edge(was, now))
             self._prev_keys[i] = now
-        if gui_open and cursor_norm is not None and abs(snap.mouse_dx) + abs(snap.mouse_dy) <= 3.0:
+        if gui_open and cursor_norm is not None:
             tokens.append(self.spec.mouse_unit_to_bin(cursor_norm[0]))
             tokens.append(self.spec.mouse_unit_to_bin(cursor_norm[1]))
         else:
@@ -186,6 +186,8 @@ class InputTap:
         tokens.append(_edge(self._prev_lmb, snap.lmb))
         tokens.append(_edge(self._prev_rmb, snap.rmb))
         self._prev_lmb, self._prev_rmb = snap.lmb, snap.rmb
+        if self.spec.has_wheel:
+            tokens.append(self.spec.wheel_to_bin(snap.wheel))
         arr = np.asarray(tokens, dtype=np.int64)
         self.machine.apply(torch.from_numpy(arr.copy()))
         return arr

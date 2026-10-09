@@ -1,13 +1,84 @@
-"""AtomSpike CLI: collect, train, convert, eval, play, smoke."""
+"""AtomSpike CLI: collect-mc, train-bc, predict-mc, convert, eval, verify."""
 
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
+import importlib.util
 import json
+import os
+import platform
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_CONFIGS = Path(__file__).with_name("_configs")
+
+
+def _default_config_path(name: str) -> Path | None:
+    """Find a source-tree config first, then the copy shipped in wheels."""
+    for path in (ROOT / "configs" / name, PACKAGE_CONFIGS / name):
+        if path.is_file():
+            return path
+    return None
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def _probability(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
+def _port(value: str) -> int:
+    parsed = int(value)
+    if not 1 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("must be an integer between 1 and 65535")
+    return parsed
+
+
+def _region(value: str) -> tuple[int, int, int, int]:
+    try:
+        parts = tuple(int(x.strip()) for x in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be left,top,width,height") from exc
+    if len(parts) != 4 or parts[2] <= 0 or parts[3] <= 0:
+        raise argparse.ArgumentTypeError("must be left,top,width,height with positive width/height")
+    return parts
+
+
+def _loopback_host(value: str) -> str:
+    import ipaddress
+
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a loopback IP address") from exc
+    if not address.is_loopback:
+        raise argparse.ArgumentTypeError("must be a loopback IP address")
+    return value
 
 
 def _json_default(obj):
@@ -18,14 +89,14 @@ def _json_default(obj):
     return str(obj)
 
 
-def _cfg(args) -> "AtomSpikeConfig":
+def _cfg(args):
     from atomspike.config import load_config
 
     path = getattr(args, "config", None)
     if path:
         return load_config(path)
-    default = ROOT / "configs" / "default.yaml"
-    if default.exists():
+    default = _default_config_path("default.yaml")
+    if default is not None:
         return load_config(default)
     return load_config(None)
 
@@ -83,13 +154,7 @@ def cmd_collect_mc(args) -> int:
         if not hits:
             print("(no matching windows)")
         return 0
-    region = None
-    if args.region:
-        parts = [int(x) for x in args.region.split(",")]
-        if len(parts) != 4:
-            print("--region must be left,top,width,height", file=sys.stderr)
-            return 2
-        region = (parts[0], parts[1], parts[2], parts[3])
+    region = args.region
     if args.title:
         cfg.minecraft.window_title = args.title
         cfg.capture.window_title = args.title
@@ -132,10 +197,14 @@ def cmd_sidecar_send(args) -> int:
     """Push sample JSON to the collector UDP port (localhost only)."""
     import time
 
-    from atomspike.capture.sidecar import SIDECAR_HOST, SIDECAR_PORT, send_sidecar
+    from atomspike.capture.sidecar import SIDECAR_HOST, send_sidecar
 
     if args.json:
-        payload = json.loads(args.json)
+        try:
+            payload = json.loads(args.json)
+        except json.JSONDecodeError as exc:
+            print(f"--json is not valid JSON: {exc}", file=sys.stderr)
+            return 2
         if not isinstance(payload, dict):
             print("--json must be a JSON object", file=sys.stderr)
             return 2
@@ -165,6 +234,14 @@ def cmd_sidecar_send(args) -> int:
             "mouse_ny": 0.5,
             "hovered_slot": -1,
             "carried_count": 0,
+            "hand_item": "stone_pickaxe",
+            "hover_item": "",
+            "carry_item": "",
+            "inv": [0] * 36,
+            "adv_done": 3,
+            "adv_next": "story/mine_stone",
+            "adv_next_frac": 0.0,
+            "singleplayer": True,
         }
     host = args.host or SIDECAR_HOST
     port = int(args.port)
@@ -184,6 +261,9 @@ def cmd_predict_mc(args) -> int:
 
     inject = bool(getattr(args, "inject", False))
     cfg = _cfg(args)
+    learn_on = bool(getattr(args, "learn", False)) or (
+        bool(cfg.learn.enabled) and not bool(getattr(args, "no_learn", False))
+    )
     if getattr(args, "list_windows", False):
         hits = list_windows(args.title or "")
         for w in hits:
@@ -191,13 +271,7 @@ def cmd_predict_mc(args) -> int:
         if not hits:
             print("(no matching windows)")
         return 0
-    region = None
-    if args.region:
-        parts = [int(x) for x in args.region.split(",")]
-        if len(parts) != 4:
-            print("--region must be left,top,width,height", file=sys.stderr)
-            return 2
-        region = (parts[0], parts[1], parts[2], parts[3])
+    region = args.region
     if args.title:
         cfg.minecraft.window_title = args.title
         cfg.capture.window_title = args.title
@@ -206,22 +280,28 @@ def cmd_predict_mc(args) -> int:
     if args.dry_run and seconds is None:
         seconds = 2.0
     if inject and args.dry_run:
-        print("--inject has no effect in --dry-run", file=sys.stderr)
-        inject = False
+        print("--inject cannot be combined with --dry-run", file=sys.stderr)
+        return 2
     if inject and seconds is None:
         seconds = 30.0
     if inject:
         print(
             f"CLOSED LOOP: the model will drive your keyboard/mouse for up to {seconds:.0f}s. "
-            f"Singleplayer only. Emergency stop={cfg.minecraft.stop_key}. "
-            "After the model loads, click into Minecraft.",
+            f"A fresh Fabric sidecar must attest to singleplayer. Emergency stop={cfg.minecraft.stop_key}. "
+            + (
+                "Sampled self-play actor-critic learning is ON. "
+                if learn_on
+                else "Online learning is off. "
+            )
+            + "After the model loads, click into Minecraft.",
             file=sys.stderr,
         )
     elif not args.dry_run:
         print(
             "Predicting local Minecraft at "
             f"{cfg.capture.fps} fps (no OS inject). Stop={cfg.minecraft.stop_key}. "
-            "After the model loads, click into Minecraft. Singleplayer / LAN research only.",
+            + ("Online adaptation off. " if not learn_on else "Human-demonstration adaptation on (10Hz). ")
+            + "After the model loads, click into Minecraft. Singleplayer / LAN research only.",
             file=sys.stderr,
         )
     else:
@@ -250,11 +330,25 @@ def cmd_predict_mc(args) -> int:
                 else (False if getattr(args, "no_viz", False) or args.dry_run else None)
             ),
             viz_hz=float(getattr(args, "viz_hz", 120.0) or 120.0),
+            learn=(False if getattr(args, "no_learn", False) else (True if getattr(args, "learn", False) else None)),
+            resume_plastic=bool(getattr(args, "resume_plastic", False)),
+            hud=False if getattr(args, "no_hud", False) else None,
         )
     except (RuntimeError, FileNotFoundError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, default=_json_default))
+    if result.get("stop_reason"):
+        print(f"stop_reason={result['stop_reason']}", file=sys.stderr)
+    hwnd = int(result.get("game_hwnd") or 0)
+    if hwnd and sys.platform == "win32":
+        try:
+            from atomspike.viz.overlay_win import handoff_game_focus, restore_game_focus
+
+            restore_game_focus(hwnd, park_cursor=False, allow_alt=False)
+            handoff_game_focus(hwnd)
+        except Exception:
+            pass
     return 0 if result.get("n_ticks", 0) > 0 else 1
 
 
@@ -293,7 +387,13 @@ def cmd_convert(args) -> int:
     if args.method == "spiked_attention":
         result = convert_spiked_attention(cfg, args.ckpt, args.out)
     else:
-        result = convert_checkpoint(cfg, args.ckpt, args.out, data_path=args.data)
+        result = convert_checkpoint(
+            cfg,
+            args.ckpt,
+            args.out,
+            data_path=args.data,
+            allow_lossy=bool(getattr(args, "allow_lossy_snn", False)),
+        )
     print(json.dumps(result, indent=2))
     return 0
 
@@ -303,7 +403,7 @@ def cmd_eval(args) -> int:
 
     cfg = _cfg(args)
     if getattr(args, "data", None):
-        result = evaluate_offline(cfg, args.ckpt, args.data)
+        result = evaluate_offline(cfg, args.ckpt, args.data, all_data=bool(getattr(args, "all_data", False)))
         print(json.dumps(result, indent=2, default=_json_default))
         return 0
     if cfg.env.kind.lower() in {"minecraft", "mc", "minerl"}:
@@ -317,6 +417,26 @@ def cmd_eval(args) -> int:
         return 2
     result = evaluate_policy(cfg, args.ckpt, episodes=args.episodes)
     print(json.dumps(result, indent=2, default=_json_default))
+    return 0
+
+
+def cmd_plan_interventions(args) -> int:
+    from atomspike.eval.interventions import make_pair_plan, write_pair_plan
+
+    rows = make_pair_plan(
+        args.snapshots, treatment=args.treatment, control=args.control,
+        goal=args.goal, horizon_ticks=args.horizon_ticks,
+    )
+    write_pair_plan(args.out, rows)
+    print(json.dumps({"plan": str(args.out), "experiment_id": rows[0]["experiment_id"], "pairs": len(rows)}, indent=2))
+    return 0
+
+
+def cmd_eval_interventions(args) -> int:
+    from atomspike.eval.interventions import evaluate_pair_results
+
+    result = evaluate_pair_results(args.plan, args.results, min_pairs=args.min_pairs)
+    print(json.dumps(result, indent=2))
     return 0
 
 
@@ -411,9 +531,11 @@ def cmd_smoke(args) -> int:
     from atomspike.train.pipeline import run_pipeline
     from atomspike.verify import run_verify
 
-    cfg_path = ROOT / "configs" / "smoke.yaml"
-    cfg = load_config(cfg_path if cfg_path.exists() else None)
-    verify = run_verify(cfg_path if cfg_path.exists() else Path("configs/smoke.yaml"))
+    cfg_path = _default_config_path("smoke.yaml")
+    if cfg_path is None:
+        raise RuntimeError("smoke.yaml was not installed with AtomSpike")
+    cfg = load_config(cfg_path)
+    verify = run_verify(cfg_path)
     workdir = Path(args.workdir)
     result = run_pipeline(
         cfg,
@@ -458,13 +580,94 @@ def cmd_verify(args) -> int:
     from atomspike.config import load_config
     from atomspike.verify import run_verify
 
-    cfg_path = Path(args.config) if getattr(args, "config", None) else ROOT / "configs" / "smoke.yaml"
-    if not cfg_path.exists():
-        cfg_path = ROOT / "configs" / "default.yaml"
+    cfg_path = Path(args.config) if getattr(args, "config", None) else _default_config_path("smoke.yaml")
+    if cfg_path is None:
+        raise RuntimeError("smoke.yaml was not installed with AtomSpike")
     load_config(cfg_path)
     report = run_verify(cfg_path)
     print(json.dumps(report, indent=2, default=_json_default))
     return 0
+
+
+def cmd_doctor(args) -> int:
+    """Report environment readiness without importing heavyweight dependencies."""
+    required = {
+        "torch": "torch",
+        "numpy": "numpy",
+        "Pillow": "PIL",
+        "h5py": "h5py",
+        "PyYAML": "yaml",
+        "tqdm": "tqdm",
+    }
+    optional = {
+        "capture:mss": "mss",
+        "capture:pynput": "pynput",
+        "capture:pygame-ce": "pygame",
+        "vizdoom": "vizdoom",
+        "wandb": "wandb",
+    }
+
+    def package_status(distribution: str, module: str) -> dict[str, object]:
+        present = importlib.util.find_spec(module) is not None
+        version = None
+        if present:
+            with suppress(importlib.metadata.PackageNotFoundError):
+                version = importlib.metadata.version(distribution)
+        return {"installed": present, "version": version}
+
+    dependencies = {name: package_status(name, module) for name, module in required.items()}
+    optional_dependencies = {name: package_status(name.split(":")[-1], module) for name, module in optional.items()}
+    config_report: dict[str, object] = {}
+    yaml_ready = bool(dependencies["PyYAML"]["installed"])
+    for name in ("default.yaml", "smoke.yaml", "minecraft.yaml"):
+        path = _default_config_path(name)
+        item: dict[str, object] = {"path": str(path) if path else None, "ok": False}
+        if path is None:
+            item["error"] = "not found"
+        elif not yaml_ready:
+            item["error"] = "PyYAML is not installed"
+        else:
+            try:
+                from atomspike.config import load_config
+
+                load_config(path)
+                item["ok"] = True
+            except Exception as exc:
+                item["error"] = str(exc)
+        config_report[name] = item
+
+    python_ok = sys.version_info >= (3, 10)
+    required_ok = all(bool(item["installed"]) for item in dependencies.values())
+    configs_ok = all(bool(item["ok"]) for item in config_report.values())
+    report = {
+        "ok": bool(python_ok and required_ok and configs_ok),
+        "python": {
+            "ok": python_ok,
+            "version": platform.python_version(),
+            "executable": sys.executable,
+            "platform": platform.platform(),
+        },
+        "workspace": {"cwd": str(Path.cwd()), "writable": os.access(Path.cwd(), os.W_OK)},
+        "dependencies": dependencies,
+        "optional_dependencies": optional_dependencies,
+        "configs": config_report,
+    }
+    if args.json:
+        print(json.dumps(report, indent=2, default=_json_default))
+    else:
+        mark = "OK" if report["ok"] else "NOT READY"
+        print(f"AtomSpike doctor: {mark}")
+        print(f"Python {report['python']['version']}  {report['python']['executable']}")
+        for name, item in dependencies.items():
+            version = f" {item['version']}" if item["version"] else ""
+            print(f"  {'ok' if item['installed'] else 'MISSING':7} {name}{version}")
+        for name, item in config_report.items():
+            detail = item.get("path") or item.get("error") or ""
+            print(f"  {'ok' if item['ok'] else 'ERROR':7} {name}  {detail}")
+        missing_optional = [name for name, item in optional_dependencies.items() if not item["installed"]]
+        if missing_optional:
+            print("Optional (install only when needed): " + ", ".join(missing_optional))
+    return 0 if report["ok"] else 1
 
 
 def cmd_info(args) -> int:
@@ -500,6 +703,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_arg(p)
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    s = sub.add_parser("doctor", help="check Python, dependencies, and bundled configs")
+    s.add_argument("--json", action="store_true", help="print the full machine-readable report")
+    s.set_defaults(func=cmd_doctor)
+
     s = sub.add_parser("info", help="print model size and config")
     _add_config_arg(s, suppress=True)
     s.set_defaults(func=cmd_info)
@@ -507,24 +714,35 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("collect", help="T0: record scripted/human demos to HDF5")
     _add_config_arg(s, suppress=True)
     s.add_argument("--out", required=True)
-    s.add_argument("--episodes", type=int, default=40)
+    s.add_argument("--episodes", type=_positive_int, default=40)
     s.set_defaults(func=cmd_collect)
 
     s = sub.add_parser("collect-mc", help="T0 Minecraft: 30fps window + HUD/NBT/sidecar + key/mouse")
     _add_config_arg(s, suppress=True)
     s.add_argument("--out", default="runs/mc.h5")
     s.add_argument("--overwrite", action="store_true", help="discard existing --out file instead of appending")
-    s.add_argument("--seconds", type=float, default=None, help="stop after N seconds (default: until stop key)")
+    s.add_argument(
+        "--seconds", type=_positive_float, default=None, help="stop after N seconds (default: until stop key)"
+    )
     s.add_argument("--title", default=None, help="window title substring (default: Minecraft)")
     s.add_argument("--desktop", action="store_true", help="capture the whole monitor instead of the game window")
-    s.add_argument("--region", default=None, help="left,top,width,height")
-    s.add_argument("--dry-run", action="store_true", help="no game window; write dummy frames for a smoke test")
+    s.add_argument("--region", type=_region, default=None, help="left,top,width,height")
+    s.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="no game window; write dummy frames to a new --out path for a smoke test",
+    )
     s.add_argument("--list-windows", action="store_true", help="print visible windows and exit")
     s.add_argument("--saves-dir", default=None, help="Minecraft saves folder (default: APPDATA/.minecraft/saves)")
-    s.add_argument("--log-every", type=float, default=1.0, help="seconds between live status lines (0=off)")
+    s.add_argument(
+        "--log-every", type=_non_negative_float, default=1.0, help="seconds between live status lines (0=off)"
+    )
     s.add_argument("--quiet", action="store_true", help="no live status; only start/end summary")
-    s.add_argument("--preview", action="store_true", help="force the capture preview window (including --dry-run)")
-    s.add_argument("--no-preview", action="store_true", help="do not open the capture preview window")
+    preview = s.add_mutually_exclusive_group()
+    preview.add_argument(
+        "--preview", action="store_true", help="force the capture preview window (including --dry-run)"
+    )
+    preview.add_argument("--no-preview", action="store_true", help="do not open the capture preview window")
     s.set_defaults(func=cmd_collect_mc)
 
     s = sub.add_parser(
@@ -532,28 +750,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="send localhost UDP JSON so collect-mc live log shows src=sidecar",
     )
     s.add_argument("--json", default=None, help="JSON object string (default: demo player stats)")
-    s.add_argument("--host", default="127.0.0.1")
-    s.add_argument("--port", type=int, default=21337)
-    s.add_argument("--count", type=int, default=30, help="how many packets")
-    s.add_argument("--hz", type=float, default=20.0, help="send rate")
+    s.add_argument("--host", type=_loopback_host, default="127.0.0.1")
+    s.add_argument("--port", type=_port, default=21337)
+    s.add_argument("--count", type=_positive_int, default=30, help="how many packets")
+    s.add_argument("--hz", type=_positive_float, default=20.0, help="send rate")
     s.set_defaults(func=cmd_sidecar_send)
 
-    s = sub.add_parser("predict-mc", help="Minecraft 30fps live prediction (tokens/controls, no OS inject)")
+    s = sub.add_parser("predict-mc", help="Minecraft 30fps live prediction, optionally with local input injection")
     _add_config_arg(s, suppress=True)
     s.add_argument("--ckpt", required=True, help="trained checkpoint")
-    s.add_argument("--seconds", type=float, default=None)
+    s.add_argument("--seconds", type=_positive_float, default=None)
     s.add_argument("--title", default=None)
     s.add_argument("--desktop", action="store_true")
-    s.add_argument("--region", default=None, help="left,top,width,height")
+    s.add_argument("--region", type=_region, default=None, help="left,top,width,height")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--dump", default=None, help="JSONL path for tokens/controls")
-    s.add_argument("--inject", action="store_true", help="drive local keyboard/mouse (singleplayer only, F9 stop)")
+    s.add_argument(
+        "--inject",
+        action="store_true",
+        help="drive local keyboard/mouse only after a fresh Fabric sidecar attests to singleplayer (F9 stop)",
+    )
     s.add_argument("--sample", action="store_true", help="sample actions instead of argmax (more motor variation)")
     s.add_argument("--greedy", action="store_true", help="disable latent/task-line sampling")
-    s.add_argument("--explore", type=float, default=None, help="chance of jumping to a random task-line phase (0-1)")
-    s.add_argument("--viz", action="store_true", help="force the SNN activity window (including --dry-run)")
-    s.add_argument("--no-viz", action="store_true", help="do not open the SNN activity window")
-    s.add_argument("--viz-hz", type=float, default=120.0, help="SNN window refresh rate (default 120)")
+    s.add_argument(
+        "--explore", type=_probability, default=None, help="chance of jumping to a random task-line phase (0-1)"
+    )
+    viz = s.add_mutually_exclusive_group()
+    viz.add_argument("--viz", action="store_true", help="force the SNN activity window (including --dry-run)")
+    viz.add_argument("--no-viz", action="store_true", help="do not open the SNN activity window")
+    s.add_argument("--viz-hz", type=_positive_float, default=60.0, help="SNN window refresh rate (default 60)")
+    s.add_argument("--no-hud", action="store_true", help="do not overlay detections on the Minecraft window")
+    learn = s.add_mutually_exclusive_group()
+    learn.add_argument(
+        "--learn",
+        action="store_true",
+        help="online adaptation: human demonstrations normally, actor-critic self-play with --inject",
+    )
+    learn.add_argument("--no-learn", action="store_true", help="freeze weights during predict-mc")
+    s.add_argument(
+        "--resume-plastic",
+        action="store_true",
+        help="explicitly load the adjacent .plastic.pt adaptation checkpoint; disabled by default",
+    )
     s.set_defaults(func=cmd_predict_mc)
 
     s = sub.add_parser("train-bc", help="T1: behavior cloning warm-start")
@@ -582,39 +820,66 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", required=True)
     s.set_defaults(func=cmd_train_peft)
 
-    s = sub.add_parser("convert", help="T6: training-free ANN to SNN")
+    s = sub.add_parser("convert", help="T6: calibrated, lossy binary-activation experiment")
     _add_config_arg(s, suppress=True)
     s.add_argument("--ckpt", required=True)
     s.add_argument("--out", required=True)
-    s.add_argument("--data", default=None, nargs="+", help="h5 file(s) or directory for PMSM calibration")
+    s.add_argument("--data", default=None, nargs="+", help="required h5 file(s) or directory for PMSM calibration")
     s.add_argument("--method", choices=["pmsm", "spiked_attention"], default="pmsm")
+    s.add_argument(
+        "--allow-lossy-snn",
+        action="store_true",
+        help="acknowledge that PMSM is an experimental lossy binary approximation, not a measured energy result",
+    )
     s.set_defaults(func=cmd_convert)
 
     s = sub.add_parser("eval", help="rollout success / latency / token acc")
     _add_config_arg(s, suppress=True)
     s.add_argument("--ckpt", required=True)
-    s.add_argument("--episodes", type=int, default=12)
-    s.add_argument("--data", default=None, nargs="+", help="h5 file(s) or directory of h5 files (Minecraft offline eval)")
+    s.add_argument("--episodes", type=_positive_int, default=12)
+    s.add_argument(
+        "--data", default=None, nargs="+", help="h5 file(s) or directory of h5 files (Minecraft offline eval)"
+    )
+    s.add_argument(
+        "--all-data",
+        action="store_true",
+        help="explicitly evaluate every demo; default uses held-out recording sessions only",
+    )
     s.set_defaults(func=cmd_eval)
 
-    s = sub.add_parser("play", help="closed-loop rollout paced at 30Hz")
+    s = sub.add_parser("plan-interventions", help="randomize paired world-snapshot trials; never controls the game")
+    s.add_argument("--snapshots", required=True, nargs="+", help="distinct world snapshot archive files, one per pair")
+    s.add_argument("--treatment", required=True, choices=("attack", "use", "move", "jump", "look", "idle"))
+    s.add_argument("--control", required=True, choices=("attack", "use", "move", "jump", "look", "idle"))
+    s.add_argument("--goal", required=True, help="declared task for every pair")
+    s.add_argument("--horizon-ticks", type=_positive_int, default=45)
+    s.add_argument("--out", required=True, help="new JSONL plan; existing file is never overwritten")
+    s.set_defaults(func=cmd_plan_interventions)
+
+    s = sub.add_parser("eval-interventions", help="audit manual paired-trial results; no gameplay or causal certification")
+    s.add_argument("--plan", required=True)
+    s.add_argument("--results", required=True)
+    s.add_argument("--min-pairs", type=_positive_int, default=20)
+    s.set_defaults(func=cmd_eval_interventions)
+
+    s = sub.add_parser("play", help="closed-loop synthetic rollout paced at 30Hz")
     _add_config_arg(s, suppress=True)
     s.add_argument("--ckpt", required=True)
-    s.add_argument("--episodes", type=int, default=4)
+    s.add_argument("--episodes", type=_positive_int, default=4)
     s.add_argument("--sample", action="store_true")
     s.add_argument("--unpaced", action="store_true", help="realtime clock without sleep")
     s.add_argument("--eval-only", action="store_true", help="sim-time eval instead of paced play")
-    s.add_argument("--inject", action="store_true", help="drive local keyboard/mouse (singleplayer only, F9 stop)")
+    s.add_argument("--inject", action="store_true", help="rejected here; use safety-gated predict-mc --inject instead")
     s.set_defaults(func=cmd_play)
 
-    s = sub.add_parser("verify", help="regression tests: LoRA reload, PMSM persist, 30Hz clock")
+    s = sub.add_parser("verify", help="regression tests: calibrated PMSM persistence, data safety, 30Hz clock")
     _add_config_arg(s, suppress=True)
     s.set_defaults(func=cmd_verify)
 
-    s = sub.add_parser("pipeline", help="run T0-T6 on the synthetic env")
+    s = sub.add_parser("pipeline", help="run the synthetic regression pipeline (including optional lossy conversion)")
     _add_config_arg(s, suppress=True)
     s.add_argument("--workdir", default="runs/default")
-    s.add_argument("--episodes", type=int, default=40)
+    s.add_argument("--episodes", type=_positive_int, default=40)
     s.add_argument("--skip-rl", action="store_true")
     s.add_argument("--skip-peft", action="store_true")
     s.add_argument("--skip-convert", action="store_true")
@@ -623,12 +888,21 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("smoke", help="tiny CPU end-to-end sanity check")
     _add_config_arg(s, suppress=True)
     s.add_argument("--workdir", default="runs/smoke")
-    s.add_argument("--episodes", type=int, default=16)
+    s.add_argument("--episodes", type=_positive_int, default=16)
     s.set_defaults(func=cmd_smoke)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
+    from atomspike.config import ConfigError
+
     parser = build_parser()
     args = parser.parse_args(argv)
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
+    except (ConfigError, FileNotFoundError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2

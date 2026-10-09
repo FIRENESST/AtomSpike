@@ -1,0 +1,7 @@
+# Real-time Minecraft overrides for the canonical production defaults.
+encoder:
+  frame_size: 160
+
+dual_rate:
+  mode: realtime
+  pace: true

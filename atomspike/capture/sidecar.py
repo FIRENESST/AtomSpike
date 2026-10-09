@@ -39,8 +39,32 @@ SIDECAR_FIELDS = (
     "mouse_ny",
     "hovered_slot",
     "carried_count",
+    "hand_item",
+    "hover_item",
+    "carry_item",
+    "inv",
+    "menu",
     "mouse_grabbed",
     "gui",
+    "adv_done",
+    "adv_next_frac",
+    "adv_next",
+    "sky_light",
+    "can_see_sky",
+    "look_miss",
+    "look_block_id",
+    "look_entity_id",
+    "dead",
+    "paused",
+    "inv_open",
+    "blocks_seen",
+    "broke",
+    "placed",
+    # This is emitted by the Fabric client from getSingleplayerServer().  It is
+    # deliberately required by the OS-injection gate; absence is not evidence
+    # that a world is safe to automate.
+    "singleplayer",
+    "session_nonce",
 )
 
 
@@ -56,3 +80,20 @@ def send_sidecar(payload: dict[str, Any], host: str = SIDECAR_HOST, port: int = 
     finally:
         sock.close()
     return len(data)
+
+
+SIDECAR_CMD_PORT = 21338
+
+
+def send_sidecar_cmd(
+    cmd: str,
+    host: str = SIDECAR_HOST,
+    port: int = SIDECAR_CMD_PORT,
+    *,
+    nonce: str | None = None,
+) -> int:
+    """Send an authenticated-session command to the local sidecar."""
+    payload = {"cmd": str(cmd)}
+    if nonce is not None:
+        payload["nonce"] = str(nonce)
+    return send_sidecar(payload, host=host, port=port)
